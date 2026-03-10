@@ -1,0 +1,8 @@
+node_modules/
+bin/
+tmp/
+npm-debug.log*
+.venv/
+.pytest_cache/
+.omx/
+__pycache__/
