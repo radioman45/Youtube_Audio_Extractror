@@ -2,4 +2,5 @@ fastapi
 uvicorn
 yt-dlp
 imageio-ffmpeg
+httpx
 pytest

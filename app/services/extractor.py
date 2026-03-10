@@ -4,9 +4,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from urllib.parse import urlparse
 
 import imageio_ffmpeg
@@ -16,8 +17,19 @@ from yt_dlp.utils import DownloadError
 from app.services.time_utils import parse_timestamp, seconds_to_ffmpeg_timestamp
 
 
-AudioFormat = Literal["mp3", "m4a", "wav", "opus"]
-SUPPORTED_FORMATS: tuple[AudioFormat, ...] = ("mp3", "m4a", "wav", "opus")
+AudioFormat = Literal["mp3", "m4a", "wav", "opus", "aac"]
+ProgressCallback = Callable[[int, str], None]
+SUPPORTED_FORMATS: tuple[AudioFormat, ...] = ("mp3", "m4a", "wav", "opus", "aac")
+VIDEO_QUALITY_HEIGHTS: dict[str, int] = {
+    "360p": 360,
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+    "1440p": 1440,
+    "2160p": 2160,
+    "4320p": 4320,
+}
+SUPPORTED_VIDEO_QUALITIES: tuple[str, ...] = tuple(VIDEO_QUALITY_HEIGHTS.keys())
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 YOUTUBE_HOSTS = {
     "youtube.com",
@@ -46,10 +58,18 @@ class ExtractionOptions:
 
 
 @dataclass(slots=True)
+class SongExtractionOptions:
+    url: str
+    start_time: str | None = None
+    end_time: str | None = None
+
+
+@dataclass(slots=True)
 class ExtractionResult:
     file_path: Path
     download_name: str
     temp_dir: Path
+    media_type: str = "application/octet-stream"
 
 
 def is_supported_youtube_url(url: str) -> bool:
@@ -64,10 +84,10 @@ def validate_youtube_url(url: str) -> str:
     cleaned = url.strip()
     parsed = urlparse(cleaned)
     if parsed.scheme not in {"http", "https"}:
-        raise ExtractionInputError("Enter a valid YouTube URL.")
+        raise ExtractionInputError("유효한 YouTube URL을 입력해 주세요.")
 
     if parsed.netloc.lower() not in YOUTUBE_HOSTS:
-        raise ExtractionInputError("Only YouTube links are supported.")
+        raise ExtractionInputError("YouTube 링크만 지원합니다.")
 
     return cleaned
 
@@ -89,22 +109,22 @@ def validate_time_range(
     duration_seconds: int | None,
 ) -> None:
     if start_seconds is not None and start_seconds < 0:
-        raise ExtractionInputError("Start time must be 0 or greater.")
+        raise ExtractionInputError("시작 시간은 0 이상이어야 합니다.")
 
     if end_seconds is not None and end_seconds <= 0:
-        raise ExtractionInputError("End time must be greater than 0.")
+        raise ExtractionInputError("종료 시간은 0보다 커야 합니다.")
 
     if start_seconds is not None and end_seconds is not None and end_seconds <= start_seconds:
-        raise ExtractionInputError("End time must be after start time.")
+        raise ExtractionInputError("종료 시간은 시작 시간보다 뒤여야 합니다.")
 
     if duration_seconds is None:
         return
 
     if start_seconds is not None and start_seconds >= duration_seconds:
-        raise ExtractionInputError("Start time is outside the video duration.")
+        raise ExtractionInputError("시작 시간이 영상 길이를 벗어났습니다.")
 
     if end_seconds is not None and end_seconds > duration_seconds:
-        raise ExtractionInputError("End time is outside the video duration.")
+        raise ExtractionInputError("종료 시간이 영상 길이를 벗어났습니다.")
 
 
 def validate_requested_range(
@@ -116,10 +136,10 @@ def validate_requested_range(
         return
 
     if start_seconds is not None and start_seconds >= duration_seconds:
-        raise ValueError("Start time is outside the video duration.")
+        raise ValueError("시작 시간이 영상 길이를 벗어났습니다.")
 
     if end_seconds is not None and end_seconds > duration_seconds:
-        raise ValueError("End time is outside the video duration.")
+        raise ValueError("종료 시간이 영상 길이를 벗어났습니다.")
 
 
 def seconds_to_label(value: int | None) -> str:
@@ -135,7 +155,7 @@ def seconds_to_label(value: int | None) -> str:
 
 def sanitize_filename(name: str) -> str:
     cleaned = INVALID_FILENAME_CHARS.sub("", name).strip().rstrip(".")
-    return re.sub(r"\s+", " ", cleaned)[:120] or "youtube-audio"
+    return re.sub(r"\s+", " ", cleaned)[:120] or "youtube-media"
 
 
 def build_output_path(temp_dir: Path, title: str, output_format: str) -> Path:
@@ -144,22 +164,29 @@ def build_output_path(temp_dir: Path, title: str, output_format: str) -> Path:
 
 def build_download_name(
     title: str,
-    audio_format: AudioFormat,
+    output_format: str,
     start_seconds: int | None,
     end_seconds: int | None,
 ) -> str:
-    if start_seconds is None and end_seconds is None:
-        return build_output_path(Path("."), title, audio_format).name
-
     safe_title = sanitize_filename(title)
+    if start_seconds is None and end_seconds is None:
+        return f"{safe_title}.{output_format}"
+
     return (
         f"{safe_title}_{seconds_to_label(start_seconds)}"
-        f"_to_{seconds_to_label(end_seconds)}.{audio_format}"
+        f"_to_{seconds_to_label(end_seconds)}.{output_format}"
     )
 
 
 def cleanup_temp_dir(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
+
+
+def notify_progress(progress_callback: ProgressCallback | None, progress: int, message: str) -> None:
+    if progress_callback is None:
+        return
+
+    progress_callback(max(0, min(100, int(progress))), message)
 
 
 def resolve_ffmpeg_path() -> str:
@@ -169,16 +196,16 @@ def resolve_ffmpeg_path() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _ydl_base_options(ffmpeg_path: str) -> dict[str, object]:
+def ydl_base_options(ffmpeg_path: str, *, noplaylist: bool = True) -> dict[str, object]:
     return {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
+        "noplaylist": noplaylist,
         "ffmpeg_location": ffmpeg_path,
     }
 
 
-def _normalize_info(info: dict[str, object]) -> dict[str, object]:
+def normalize_info(info: dict[str, object]) -> dict[str, object]:
     if "entries" not in info:
         return info
 
@@ -186,43 +213,207 @@ def _normalize_info(info: dict[str, object]) -> dict[str, object]:
     for entry in entries:
         if isinstance(entry, dict):
             return entry
-    raise ExtractionRuntimeError("Failed to read video metadata.")
+    raise ExtractionRuntimeError("영상 메타데이터를 읽지 못했습니다.")
 
 
-def _probe_video(url: str, ffmpeg_path: str) -> dict[str, object]:
-    with YoutubeDL(_ydl_base_options(ffmpeg_path)) as ydl:
+def probe_media_info(url: str, ffmpeg_path: str | None = None, *, noplaylist: bool = True) -> dict[str, object]:
+    resolved_ffmpeg = ffmpeg_path or resolve_ffmpeg_path()
+    with YoutubeDL(ydl_base_options(resolved_ffmpeg, noplaylist=noplaylist)) as ydl:
         info = ydl.extract_info(url, download=False)
 
     if not isinstance(info, dict):
-        raise ExtractionRuntimeError("Failed to read video metadata.")
+        raise ExtractionRuntimeError("영상 메타데이터를 읽지 못했습니다.")
 
-    return _normalize_info(info)
+    return normalize_info(info) if noplaylist else info
 
 
-def _download_source_audio(url: str, work_dir: Path, ffmpeg_path: str) -> tuple[Path, dict[str, object]]:
-    ydl_options = _ydl_base_options(ffmpeg_path) | {
-        "format": "bestaudio/best",
-        "outtmpl": str(work_dir / "%(title)s.%(ext)s"),
-    }
+def build_download_progress_hook(
+    progress_callback: ProgressCallback | None,
+    *,
+    download_message: str,
+    finished_message: str,
+    start_progress: int = 15,
+    end_progress: int = 80,
+) -> Callable[[dict[str, object]], None]:
+    def handle_progress(progress_data: dict[str, object]) -> None:
+        status = progress_data.get("status")
+        if status == "finished":
+            notify_progress(progress_callback, end_progress, finished_message)
+            return
 
-    with YoutubeDL(ydl_options) as ydl:
-        info = _normalize_info(ydl.extract_info(url, download=True))
-        expected_path = Path(ydl.prepare_filename(info))
+        if status != "downloading":
+            return
 
-    if expected_path.exists():
-        return expected_path, info
+        downloaded_bytes = progress_data.get("downloaded_bytes")
+        total_bytes = progress_data.get("total_bytes") or progress_data.get("total_bytes_estimate")
+        if not isinstance(downloaded_bytes, (int, float)) or not isinstance(total_bytes, (int, float)) or total_bytes <= 0:
+            notify_progress(progress_callback, start_progress, download_message)
+            return
+
+        ratio = max(0.0, min(float(downloaded_bytes) / float(total_bytes), 1.0))
+        notify_progress(progress_callback, start_progress + int(ratio * (end_progress - start_progress)), download_message)
+
+    return handle_progress
+
+
+def collect_downloaded_file(work_dir: Path, expected_path: Path | None = None) -> Path:
+    if expected_path is not None and expected_path.exists():
+        return expected_path
 
     candidates = sorted(
         [entry for entry in work_dir.iterdir() if entry.is_file()],
-        key=lambda item: item.stat().st_size,
+        key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise ExtractionRuntimeError("Downloaded source audio file was not found.")
-    return candidates[0], info
+        raise ExtractionRuntimeError("다운로드된 파일을 찾지 못했습니다.")
+    return candidates[0]
 
 
-def _build_ffmpeg_command(
+def download_source_audio(
+    url: str,
+    work_dir: Path,
+    ffmpeg_path: str,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[Path, dict[str, object]]:
+    ydl_options = ydl_base_options(ffmpeg_path) | {
+        "format": "bestaudio/best",
+        "outtmpl": str(work_dir / "%(title)s.%(ext)s"),
+        "progress_hooks": [
+            build_download_progress_hook(
+                progress_callback,
+                download_message="원본 오디오를 다운로드하는 중입니다.",
+                finished_message="다운로드가 끝났습니다. 변환을 시작합니다.",
+            )
+        ],
+    }
+
+    with YoutubeDL(ydl_options) as ydl:
+        info = normalize_info(ydl.extract_info(url, download=True))
+        expected_path = Path(ydl.prepare_filename(info))
+
+    return collect_downloaded_file(work_dir, expected_path), info
+
+
+def build_video_format_selector(quality: str) -> str:
+    max_height = VIDEO_QUALITY_HEIGHTS[quality]
+    return (
+        f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={max_height}]+bestaudio/"
+        f"best[height<={max_height}][ext=mp4]/"
+        f"best[height<={max_height}]/best"
+    )
+
+
+def download_source_video(
+    url: str,
+    work_dir: Path,
+    ffmpeg_path: str,
+    quality: str,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[Path, dict[str, object]]:
+    ydl_options = ydl_base_options(ffmpeg_path) | {
+        "format": build_video_format_selector(quality),
+        "merge_output_format": "mp4",
+        "outtmpl": str(work_dir / "%(title)s.%(ext)s"),
+        "progress_hooks": [
+            build_download_progress_hook(
+                progress_callback,
+                download_message="원본 영상을 다운로드하는 중입니다.",
+                finished_message="다운로드가 끝났습니다. 후처리를 시작합니다.",
+                start_progress=12,
+                end_progress=78,
+            )
+        ],
+    }
+
+    with YoutubeDL(ydl_options) as ydl:
+        info = normalize_info(ydl.extract_info(url, download=True))
+        expected_path = Path(ydl.prepare_filename(info))
+        merged_path = expected_path.with_suffix(".mp4")
+
+    expected = merged_path if merged_path.exists() else expected_path
+    return collect_downloaded_file(work_dir, expected), info
+
+
+def get_best_thumbnail_url(info: dict[str, object]) -> str | None:
+    thumbnails = info.get("thumbnails")
+    if isinstance(thumbnails, list):
+        for thumbnail in reversed(thumbnails):
+            if isinstance(thumbnail, dict) and thumbnail.get("url"):
+                return str(thumbnail["url"])
+
+    thumbnail = info.get("thumbnail")
+    if isinstance(thumbnail, str) and thumbnail:
+        return thumbnail
+    return None
+
+
+def download_thumbnail(info: dict[str, object], work_dir: Path) -> Path | None:
+    thumbnail_url = get_best_thumbnail_url(info)
+    if not thumbnail_url:
+        return None
+
+    parsed = urlparse(thumbnail_url)
+    suffix = Path(parsed.path).suffix or ".jpg"
+    output_path = work_dir / f"{sanitize_filename(str(info.get('title') or 'cover'))}_cover{suffix}"
+
+    try:
+        urllib.request.urlretrieve(thumbnail_url, output_path)
+    except Exception:
+        return None
+
+    return output_path if output_path.exists() else None
+
+
+def build_metadata_map(info: dict[str, object]) -> dict[str, str]:
+    title = str(info.get("track") or info.get("title") or "YouTube Audio")
+    artist = str(info.get("artist") or info.get("uploader") or info.get("channel") or "")
+    album = str(info.get("album") or info.get("playlist_title") or info.get("channel") or "")
+    album_artist = str(info.get("album_artist") or info.get("channel") or info.get("uploader") or "")
+    date = str(info.get("release_date") or info.get("upload_date") or "")
+
+    metadata = {
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "album_artist": album_artist,
+        "date": date,
+        "comment": "Extracted with YouTube Multi Extractor",
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def build_metadata_args(metadata: dict[str, str]) -> list[str]:
+    args: list[str] = []
+    for key, value in metadata.items():
+        args.extend(["-metadata", f"{key}={value}"])
+    return args
+
+
+def decode_subprocess_output(payload: bytes) -> str:
+    if not payload:
+        return ""
+
+    for encoding in ("utf-8", "cp949"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return payload.decode("utf-8", errors="replace")
+
+
+def run_ffmpeg(command: list[str], output_path: Path) -> None:
+    completed = subprocess.run(command, capture_output=True, text=False, check=False)
+    if completed.returncode != 0 or not output_path.exists():
+        stderr_text = decode_subprocess_output(completed.stderr)
+        error_lines = stderr_text.strip().splitlines()
+        message = error_lines[-1] if error_lines else "ffmpeg 처리에 실패했습니다."
+        raise ExtractionRuntimeError(message)
+
+
+def build_audio_ffmpeg_command(
     ffmpeg_path: str,
     input_path: Path,
     output_path: Path,
@@ -245,6 +436,8 @@ def _build_ffmpeg_command(
         case "mp3":
             command.extend(["-vn", "-c:a", "libmp3lame", "-q:a", "2"])
         case "m4a":
+            command.extend(["-vn", "-c:a", "aac", "-b:a", "192k", "-f", "ipod"])
+        case "aac":
             command.extend(["-vn", "-c:a", "aac", "-b:a", "192k"])
         case "wav":
             command.extend(["-vn", "-c:a", "pcm_s16le"])
@@ -255,10 +448,13 @@ def _build_ffmpeg_command(
     return command
 
 
-def extract_audio(options: ExtractionOptions) -> ExtractionResult:
+def extract_audio(
+    options: ExtractionOptions,
+    progress_callback: ProgressCallback | None = None,
+) -> ExtractionResult:
     normalized_url = validate_youtube_url(options.url)
     if options.audio_format not in SUPPORTED_FORMATS:
-        raise ExtractionInputError("Unsupported audio format.")
+        raise ExtractionInputError("지원하지 않는 오디오 형식입니다.")
 
     start_seconds = parse_time_to_seconds(options.start_time)
     end_seconds = parse_time_to_seconds(options.end_time)
@@ -267,7 +463,8 @@ def extract_audio(options: ExtractionOptions) -> ExtractionResult:
     ffmpeg_path = resolve_ffmpeg_path()
 
     try:
-        metadata = _probe_video(normalized_url, ffmpeg_path)
+        notify_progress(progress_callback, 5, "영상 메타데이터를 확인하는 중입니다.")
+        metadata = probe_media_info(normalized_url, ffmpeg_path)
         duration = metadata.get("duration")
         duration_seconds = float(duration) if isinstance(duration, (int, float)) else None
         validate_time_range(
@@ -276,13 +473,20 @@ def extract_audio(options: ExtractionOptions) -> ExtractionResult:
             int(duration_seconds) if duration_seconds is not None else None,
         )
         validate_requested_range(start_seconds, end_seconds, duration_seconds)
+        notify_progress(progress_callback, 15, "원본 오디오를 다운로드하는 중입니다.")
 
-        source_path, downloaded_info = _download_source_audio(normalized_url, temp_dir, ffmpeg_path)
+        source_path, downloaded_info = download_source_audio(
+            normalized_url,
+            temp_dir,
+            ffmpeg_path,
+            progress_callback=progress_callback,
+        )
         title = str(downloaded_info.get("title") or metadata.get("title") or "youtube-audio")
         download_name = build_download_name(title, options.audio_format, start_seconds, end_seconds)
         output_path = temp_dir / download_name
 
-        command = _build_ffmpeg_command(
+        notify_progress(progress_callback, 85, "오디오를 변환하는 중입니다.")
+        command = build_audio_ffmpeg_command(
             ffmpeg_path=ffmpeg_path,
             input_path=source_path,
             output_path=output_path,
@@ -290,17 +494,127 @@ def extract_audio(options: ExtractionOptions) -> ExtractionResult:
             start_seconds=start_seconds,
             end_seconds=end_seconds,
         )
+        run_ffmpeg(command, output_path)
 
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed.returncode != 0 or not output_path.exists():
-            error_lines = completed.stderr.strip().splitlines()
-            message = error_lines[-1] if error_lines else "ffmpeg conversion failed."
-            raise ExtractionRuntimeError(message)
-
-        return ExtractionResult(file_path=output_path, download_name=download_name, temp_dir=temp_dir)
+        notify_progress(progress_callback, 100, "오디오 추출이 완료되었습니다.")
+        return ExtractionResult(
+            file_path=output_path,
+            download_name=download_name,
+            temp_dir=temp_dir,
+        )
     except (DownloadError, OSError) as exc:
         cleanup_temp_dir(temp_dir)
-        raise ExtractionRuntimeError("Failed while downloading YouTube audio.") from exc
+        raise ExtractionRuntimeError("YouTube 오디오 다운로드에 실패했습니다.") from exc
+    except Exception:
+        cleanup_temp_dir(temp_dir)
+        raise
+
+
+def build_song_ffmpeg_command(
+    ffmpeg_path: str,
+    input_path: Path,
+    output_path: Path,
+    metadata: dict[str, str],
+    thumbnail_path: Path | None,
+    start_seconds: int | None,
+    end_seconds: int | None,
+) -> list[str]:
+    command = [ffmpeg_path, "-y", "-i", str(input_path)]
+
+    if thumbnail_path is not None:
+        command.extend(["-i", str(thumbnail_path)])
+
+    if start_seconds is not None:
+        command.extend(["-ss", seconds_to_ffmpeg_timestamp(float(start_seconds)) or "00:00:00.000"])
+
+    if end_seconds is not None:
+        if start_seconds is not None:
+            command.extend(["-t", str(end_seconds - start_seconds)])
+        else:
+            command.extend(["-to", seconds_to_ffmpeg_timestamp(float(end_seconds)) or "00:00:00.000"])
+
+    command.extend(["-map", "0:a:0"])
+
+    if thumbnail_path is not None:
+        command.extend(
+            [
+                "-map",
+                "1:v:0",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v:0",
+                "attached_pic",
+                "-metadata:s:v",
+                "title=Album cover",
+                "-metadata:s:v",
+                "comment=Cover (front)",
+            ]
+        )
+
+    command.extend(["-c:a", "libmp3lame", "-q:a", "0", "-id3v2_version", "3"])
+    command.extend(build_metadata_args(metadata))
+    command.append(str(output_path))
+    return command
+
+
+def extract_song_mp3(
+    options: SongExtractionOptions,
+    progress_callback: ProgressCallback | None = None,
+) -> ExtractionResult:
+    normalized_url = validate_youtube_url(options.url)
+    start_seconds = parse_time_to_seconds(options.start_time)
+    end_seconds = parse_time_to_seconds(options.end_time)
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="youtube-song-"))
+    ffmpeg_path = resolve_ffmpeg_path()
+
+    try:
+        notify_progress(progress_callback, 5, "음원 메타데이터를 확인하는 중입니다.")
+        metadata = probe_media_info(normalized_url, ffmpeg_path)
+        duration = metadata.get("duration")
+        duration_seconds = float(duration) if isinstance(duration, (int, float)) else None
+        validate_time_range(
+            start_seconds,
+            end_seconds,
+            int(duration_seconds) if duration_seconds is not None else None,
+        )
+        validate_requested_range(start_seconds, end_seconds, duration_seconds)
+        notify_progress(progress_callback, 12, "최고 음질 오디오를 다운로드하는 중입니다.")
+
+        source_path, downloaded_info = download_source_audio(
+            normalized_url,
+            temp_dir,
+            ffmpeg_path,
+            progress_callback=progress_callback,
+        )
+        merged_info = metadata | downloaded_info
+        title = str(merged_info.get("track") or merged_info.get("title") or "youtube-song")
+        output_name = build_download_name(title, "mp3", start_seconds, end_seconds)
+        output_path = temp_dir / output_name
+        thumbnail_path = download_thumbnail(merged_info, temp_dir)
+        ffmpeg_metadata = build_metadata_map(merged_info)
+
+        notify_progress(progress_callback, 84, "MP3에 메타데이터와 앨범아트를 적용하는 중입니다.")
+        command = build_song_ffmpeg_command(
+            ffmpeg_path=ffmpeg_path,
+            input_path=source_path,
+            output_path=output_path,
+            metadata=ffmpeg_metadata,
+            thumbnail_path=thumbnail_path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        run_ffmpeg(command, output_path)
+
+        notify_progress(progress_callback, 100, "노래 MP3 추출이 완료되었습니다.")
+        return ExtractionResult(
+            file_path=output_path,
+            download_name=output_name,
+            temp_dir=temp_dir,
+        )
+    except (DownloadError, OSError) as exc:
+        cleanup_temp_dir(temp_dir)
+        raise ExtractionRuntimeError("노래 MP3 추출 중 다운로드에 실패했습니다.") from exc
     except Exception:
         cleanup_temp_dir(temp_dir)
         raise

@@ -10,6 +10,6 @@ if (-not (Test-Path $python)) {
     exit 1
 }
 
-Write-Host "Starting YouTube Audio Extractor on http://127.0.0.1:8000"
+Write-Host "Starting YouTube Multi Extractor on http://127.0.0.1:8000"
 Write-Host "Press Ctrl+C to stop the server."
 & $python -m app.main

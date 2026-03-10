@@ -6,3 +6,7 @@ npm-debug.log*
 .pytest_cache/
 .omx/
 __pycache__/
+build/
+dist/
+*.spec
+chobo-study.md
