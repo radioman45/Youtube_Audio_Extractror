@@ -261,7 +261,7 @@ select {
   gap: 12px;
 }
 
-input,
+input:not([type="checkbox"]),
 select,
 .folder-display {
   width: 100%;
@@ -274,14 +274,37 @@ select,
   outline: none;
 }
 
-input::placeholder {
+input:not([type="checkbox"])::placeholder {
   color: var(--placeholder);
 }
 
-input:focus,
+input:not([type="checkbox"]):focus,
 select:focus {
   border-color: #cbd5e1;
   box-shadow: 0 0 0 4px var(--ring);
+}
+
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  min-height: 44px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-sm);
+  padding: 0 13px;
+}
+
+.check-field input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: auto;
+  margin: 0;
+}
+
+.check-field span {
+  font-size: 0.88rem;
+  font-weight: 600;
 }
 
 .folder-row,

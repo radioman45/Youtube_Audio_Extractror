@@ -9,11 +9,16 @@ from app.services.extractor import (
     is_supported_youtube_url,
 )
 from app.services.subtitle_extractor import normalize_language_code
+from app.services.whisper_subtitle_extractor import (
+    normalize_subtitle_engine,
+    normalize_whisper_model,
+)
 from app.services.time_utils import parse_timestamp, validate_time_range
 
 
 TaskType = Literal["audio", "song_mp3", "video", "subtitle", "batch"]
 BatchMode = Literal["audio", "song_mp3", "video", "subtitle"]
+SubtitleEngine = Literal["youtube", "whisper"]
 
 
 class RequestBase(BaseModel):
@@ -59,11 +64,24 @@ class ExtractRequest(RequestBase):
 
 class SubtitleRequest(RequestBase):
     subtitle_language: str = "ko"
+    subtitle_engine: SubtitleEngine = "youtube"
+    whisper_model: str = "base"
+    vad_filter: bool = True
 
     @field_validator("subtitle_language")
     @classmethod
     def validate_language(cls, value: str) -> str:
         return normalize_language_code(value)
+
+    @field_validator("subtitle_engine")
+    @classmethod
+    def validate_engine(cls, value: str) -> str:
+        return normalize_subtitle_engine(value)
+
+    @field_validator("whisper_model")
+    @classmethod
+    def validate_whisper_model_name(cls, value: str) -> str:
+        return normalize_whisper_model(value)
 
 
 class JobRequest(RequestBase):
@@ -71,6 +89,9 @@ class JobRequest(RequestBase):
     audio_format: str = "mp3"
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
+    subtitle_engine: SubtitleEngine = "youtube"
+    whisper_model: str = "base"
+    vad_filter: bool = True
     batch_mode: BatchMode | None = None
 
     @field_validator("audio_format")
@@ -92,8 +113,20 @@ class JobRequest(RequestBase):
     def validate_subtitle_language(cls, value: str) -> str:
         return normalize_language_code(value)
 
+    @field_validator("subtitle_engine")
+    @classmethod
+    def validate_subtitle_engine_name(cls, value: str) -> str:
+        return normalize_subtitle_engine(value)
+
+    @field_validator("whisper_model")
+    @classmethod
+    def validate_job_whisper_model_name(cls, value: str) -> str:
+        return normalize_whisper_model(value)
+
     @model_validator(mode="after")
     def validate_conditional_fields(self) -> Self:
         if self.task_type == "batch" and self.batch_mode is None:
             raise ValueError("batchMode is required for batch tasks.")
+        if self.task_type == "batch" and self.batch_mode == "subtitle" and self.subtitle_engine == "whisper":
+            raise ValueError("Whisper subtitle generation is only supported for single-video subtitle tasks.")
         return self

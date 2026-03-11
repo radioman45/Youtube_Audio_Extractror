@@ -1,5 +1,6 @@
 const form = document.querySelector("#job-form");
 const taskTypeInput = document.querySelector("#taskType");
+const linkSection = document.querySelector("#link-section");
 const urlInput = document.querySelector("#url");
 const startTimeInput = document.querySelector("#startTime");
 const endTimeInput = document.querySelector("#endTime");
@@ -7,10 +8,22 @@ const audioFormatField = document.querySelector("#audio-format-field");
 const audioFormatSelect = document.querySelector("#audioFormat");
 const videoQualityField = document.querySelector("#video-quality-field");
 const videoQualitySelect = document.querySelector("#videoQuality");
+const subtitleEngineField = document.querySelector("#subtitle-engine-field");
+const subtitleEngineSelect = document.querySelector("#subtitleEngine");
+const subtitleSourceField = document.querySelector("#subtitle-source-field");
+const subtitleSourceSelect = document.querySelector("#subtitleSource");
 const subtitleLanguageField = document.querySelector("#subtitle-language-field");
 const subtitleLanguageSelect = document.querySelector("#subtitleLanguage");
 const subtitleLanguageCustomField = document.querySelector("#subtitle-language-custom-field");
 const subtitleLanguageCustomInput = document.querySelector("#subtitleLanguageCustom");
+const whisperModelField = document.querySelector("#whisper-model-field");
+const whisperModelSelect = document.querySelector("#whisperModel");
+const audioUploadField = document.querySelector("#audio-upload-field");
+const audioFileInput = document.querySelector("#audioFile");
+const audioUploadHelp = document.querySelector("#audio-upload-help");
+const vadFilterField = document.querySelector("#vad-filter-field");
+const vadFilterCheckbox = document.querySelector("#vadFilter");
+const subtitleEngineHelp = document.querySelector("#subtitle-engine-help");
 const batchModeField = document.querySelector("#batch-mode-field");
 const batchModeSelect = document.querySelector("#batchMode");
 const rangeHelp = document.querySelector("#range-help");
@@ -38,36 +51,36 @@ const modeButtons = Array.from(document.querySelectorAll(".mode-button"));
 const MODE_CONFIG = {
   audio: {
     label: "오디오 추출",
-    title: "원하는 형식으로 오디오를 추출합니다.",
-    description: "전체 또는 특정 구간을 MP3, WAV, AAC 등으로 저장합니다.",
+    title: "전체 또는 특정 구간의 오디오를 원하는 형식으로 추출합니다.",
+    description: "MP3, WAV, AAC 등으로 변환할 수 있고, 시작/종료 시간을 입력하면 필요한 구간만 처리합니다.",
     submitLabel: "오디오 추출 시작",
     doneLabel: "오디오 추출이 완료되었습니다.",
   },
   song_mp3: {
     label: "노래 MP3 추출",
-    title: "고음질 MP3에 메타데이터를 함께 저장합니다.",
-    description: "제목, 아티스트, 앨범아트까지 포함한 MP3를 만듭니다.",
+    title: "고음질 MP3와 메타데이터를 함께 저장합니다.",
+    description: "제목, 아티스트, 앨범 커버를 포함한 MP3 파일을 생성합니다.",
     submitLabel: "노래 MP3 추출 시작",
     doneLabel: "노래 MP3 추출이 완료되었습니다.",
   },
   video: {
     label: "영상 추출",
-    title: "선택한 화질의 영상을 저장합니다.",
-    description: "360p부터 8K까지 선택하고 필요한 구간만 잘라낼 수 있습니다.",
+    title: "선택한 화질의 영상을 내려받습니다.",
+    description: "360p부터 8K까지 선택할 수 있고 필요한 구간만 잘라낼 수 있습니다.",
     submitLabel: "영상 추출 시작",
     doneLabel: "영상 추출이 완료되었습니다.",
   },
   subtitle: {
     label: "자막 추출",
-    title: "선택한 언어의 자막을 SRT로 저장합니다.",
-    description: "원하는 언어와 구간만 골라 .srt 파일로 받습니다.",
+    title: "YouTube 자막을 받거나 Whisper로 로컬 SRT를 생성합니다.",
+    description: "Whisper 로컬 생성은 YouTube 링크 또는 업로드한 오디오 파일 모두 지원합니다.",
     submitLabel: "자막 추출 시작",
     doneLabel: "자막 추출이 완료되었습니다.",
   },
   batch: {
-    label: "재생목록/채널 다운로드",
-    title: "재생목록 또는 채널 전체에 일괄 적용합니다.",
-    description: "선택한 기능을 전체 항목에 적용하고 결과를 ZIP으로 묶어 저장합니다.",
+    label: "배치 다운로드",
+    title: "재생목록 또는 채널 전체를 한 번에 처리합니다.",
+    description: "선택한 작업을 모든 항목에 적용하고 결과를 ZIP으로 묶어 제공합니다.",
     submitLabel: "배치 다운로드 시작",
     doneLabel: "배치 다운로드가 완료되었습니다.",
   },
@@ -86,6 +99,8 @@ const folderState = {
 
 let currentMode = "audio";
 const THEME_STORAGE_KEY = "ytme-theme";
+const ACTIVE_JOB_STORAGE_KEY = "ytme-active-job";
+let activeJobRestorePromise = null;
 
 function sleep(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -118,6 +133,36 @@ function toggleTheme() {
 function setStatus(message, state = "idle") {
   statusText.textContent = message;
   statusText.dataset.state = state;
+}
+
+function saveActiveJob(jobId, fallbackName) {
+  window.localStorage.setItem(
+    ACTIVE_JOB_STORAGE_KEY,
+    JSON.stringify({
+      jobId,
+      fallbackName,
+      mode: currentMode,
+      savedAt: Date.now(),
+    }),
+  );
+}
+
+function loadActiveJob() {
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_JOB_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw);
+  } catch (error) {
+    console.error(error);
+    window.localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
+    return null;
+  }
+}
+
+function clearActiveJob() {
+  window.localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
 }
 
 function setBusy(isBusy) {
@@ -163,7 +208,7 @@ function setProgress(progress, message = "", state = "idle", details = {}) {
   progressFill.style.width = `${safeProgress}%`;
   progressLabel.textContent = `${Math.round(safeProgress)}%`;
   progressTrack.setAttribute("aria-valuenow", String(Math.round(safeProgress)));
-  progressMessage.textContent = message || "작업을 진행하는 중입니다.";
+  progressMessage.textContent = message || "작업이 진행 중입니다.";
   progressTitle.textContent = currentMode === "batch" ? "배치 작업 진행률" : `${MODE_CONFIG[currentMode].label} 진행률`;
   setBatchSummary(details);
 }
@@ -175,7 +220,7 @@ function resetProgress() {
   progressFill.style.width = "0%";
   progressLabel.textContent = "0%";
   progressTrack.setAttribute("aria-valuenow", "0");
-  progressMessage.textContent = "작업을 준비하는 중입니다.";
+  progressMessage.textContent = "작업을 준비하고 있습니다.";
   setBatchSummary({});
 }
 
@@ -186,10 +231,58 @@ function getEffectiveSubtitleLanguage() {
   return subtitleLanguageSelect.value;
 }
 
+function isWhisperSubtitleMode() {
+  return currentMode === "subtitle" && subtitleEngineSelect.value === "whisper";
+}
+
+function isUploadWhisperMode() {
+  return isWhisperSubtitleMode() && subtitleSourceSelect.value === "audio_file";
+}
+
 function syncSubtitleLanguageUi() {
-  const shouldShowCustom =
+  const languageVisible =
     !subtitleLanguageField.classList.contains("hidden") && subtitleLanguageSelect.value === "custom";
-  subtitleLanguageCustomField.classList.toggle("hidden", !shouldShowCustom);
+  subtitleLanguageCustomField.classList.toggle("hidden", !languageVisible);
+}
+
+function syncSubtitleUi() {
+  const isBatchSubtitle = currentMode === "batch" && batchModeSelect.value === "subtitle";
+  const showEngine = currentMode === "subtitle";
+  const showLanguage = currentMode === "subtitle" || isBatchSubtitle;
+  const showWhisperOptions = isWhisperSubtitleMode();
+  const showUploadSource = showWhisperOptions;
+  const showUploadField = isUploadWhisperMode();
+
+  subtitleEngineField.classList.toggle("hidden", !showEngine);
+  subtitleSourceField.classList.toggle("hidden", !showUploadSource);
+  subtitleLanguageField.classList.toggle("hidden", !showLanguage);
+  whisperModelField.classList.toggle("hidden", !showWhisperOptions);
+  audioUploadField.classList.toggle("hidden", !showUploadField);
+  audioUploadHelp.classList.toggle("hidden", !showUploadField);
+  vadFilterField.classList.toggle("hidden", !showWhisperOptions);
+  linkSection.classList.toggle("hidden", showUploadField);
+
+  urlInput.required = !showUploadField;
+  audioFileInput.required = showUploadField;
+
+  if (showWhisperOptions && showUploadField) {
+    subtitleEngineHelp.classList.remove("hidden");
+    subtitleEngineHelp.textContent = "업로드한 오디오 파일을 로컬 faster-whisper로 전사해 SRT를 생성합니다.";
+  } else if (showWhisperOptions) {
+    subtitleEngineHelp.classList.remove("hidden");
+    subtitleEngineHelp.textContent = "긴 영상은 base, 품질과 속도 균형은 small, 고사양 PC는 large-v3-turbo를 권장합니다. 선택한 Whisper 모델은 첫 실행 시 1회 다운로드 후 로컬에 캐시됩니다.";
+  } else if (isBatchSubtitle) {
+    subtitleEngineHelp.classList.remove("hidden");
+    subtitleEngineHelp.textContent = "배치 자막은 현재 YouTube 자막 다운로드만 지원합니다.";
+  } else if (showEngine) {
+    subtitleEngineHelp.classList.remove("hidden");
+    subtitleEngineHelp.textContent = "YouTube 제공 자막이 없으면 Whisper 로컬 생성을 선택하세요.";
+  } else {
+    subtitleEngineHelp.classList.add("hidden");
+    subtitleEngineHelp.textContent = "";
+  }
+
+  syncSubtitleLanguageUi();
 }
 
 function syncModeUi() {
@@ -205,16 +298,16 @@ function syncModeUi() {
   modeTitle.textContent = MODE_CONFIG[currentMode].title;
   modeDescription.textContent =
     currentMode === "batch"
-      ? `${MODE_CONFIG.batch.description} 현재 적용 기능: ${BATCH_MODE_LABELS[effectiveBatchMode]}.`
+      ? `${MODE_CONFIG.batch.description} 현재 선택: ${BATCH_MODE_LABELS[effectiveBatchMode]}.`
       : MODE_CONFIG[currentMode].description;
 
   batchModeField.classList.toggle("hidden", currentMode !== "batch");
   audioFormatField.classList.toggle("hidden", !(currentMode === "audio" || (currentMode === "batch" && effectiveMode === "audio")));
   videoQualityField.classList.toggle("hidden", !(currentMode === "video" || (currentMode === "batch" && effectiveMode === "video")));
-  subtitleLanguageField.classList.toggle(
-    "hidden",
-    !(currentMode === "subtitle" || (currentMode === "batch" && effectiveMode === "subtitle"))
-  );
+
+  if (currentMode === "batch" && effectiveMode === "subtitle") {
+    subtitleEngineSelect.value = "youtube";
+  }
 
   rangeHelp.textContent =
     currentMode === "batch"
@@ -226,7 +319,7 @@ function syncModeUi() {
       ? `${BATCH_MODE_LABELS[effectiveBatchMode]} 배치 다운로드 시작`
       : MODE_CONFIG[currentMode].submitLabel;
 
-  syncSubtitleLanguageUi();
+  syncSubtitleUi();
 }
 
 function extractFilename(disposition, fallbackName) {
@@ -272,7 +365,7 @@ async function writeBlobToFolder(blob, filename) {
       }
 
       if (permission !== "granted") {
-        throw new Error("선택한 폴더에 쓸 권한이 필요합니다.");
+        throw new Error("선택한 폴더에 대한 쓰기 권한이 필요합니다.");
       }
     }
 
@@ -284,7 +377,7 @@ async function writeBlobToFolder(blob, filename) {
   } catch (error) {
     console.error(error);
     triggerBrowserDownload(blob, filename);
-    return "폴더 저장에 실패해 브라우저 다운로드로 전환했습니다.";
+    return "폴더 저장에 실패하여 브라우저 다운로드로 전환했습니다.";
   }
 }
 
@@ -307,7 +400,37 @@ async function handleFolderPick() {
   }
 }
 
-function buildPayload() {
+function buildUploadPayload() {
+  const formData = new FormData();
+  const audioFile = audioFileInput.files && audioFileInput.files[0];
+
+  if (!audioFile) {
+    throw new Error("업로드할 오디오 파일을 선택하세요.");
+  }
+
+  formData.append("file", audioFile);
+  formData.append("whisperModel", whisperModelSelect.value);
+  formData.append("subtitleLanguage", getEffectiveSubtitleLanguage() || "ko");
+  formData.append("vadFilter", String(Boolean(vadFilterCheckbox.checked)));
+
+  const startTime = String(startTimeInput.value || "").trim();
+  const endTime = String(endTimeInput.value || "").trim();
+  if (startTime) {
+    formData.append("startTime", startTime);
+  }
+  if (endTime) {
+    formData.append("endTime", endTime);
+  }
+
+  return {
+    uploadMode: true,
+    endpoint: "/api/subtitles/upload/jobs",
+    fallbackName: "uploaded-whisper-subtitles.srt",
+    body: formData,
+  };
+}
+
+function buildJsonPayload() {
   const commonPayload = {
     taskType: currentMode,
     url: String(urlInput.value || "").trim(),
@@ -317,55 +440,77 @@ function buildPayload() {
 
   if (currentMode === "audio") {
     return {
+      uploadMode: false,
+      endpoint: "/api/jobs",
       fallbackName: `youtube-audio.${audioFormatSelect.value}`,
-      payload: {
+      body: JSON.stringify({
         ...commonPayload,
         audioFormat: audioFormatSelect.value,
-      },
+      }),
     };
   }
 
   if (currentMode === "song_mp3") {
     return {
+      uploadMode: false,
+      endpoint: "/api/jobs",
       fallbackName: "youtube-song.mp3",
-      payload: commonPayload,
+      body: JSON.stringify(commonPayload),
     };
   }
 
   if (currentMode === "video") {
     return {
+      uploadMode: false,
+      endpoint: "/api/jobs",
       fallbackName: "youtube-video.mp4",
-      payload: {
+      body: JSON.stringify({
         ...commonPayload,
         videoQuality: videoQualitySelect.value,
-      },
+      }),
     };
   }
 
   if (currentMode === "subtitle") {
+    const subtitleEngine = subtitleEngineSelect.value;
     return {
-      fallbackName: "youtube-subtitles.srt",
-      payload: {
+      uploadMode: false,
+      endpoint: "/api/jobs",
+      fallbackName: subtitleEngine === "whisper" ? "youtube-whisper-subtitles.srt" : "youtube-subtitles.srt",
+      body: JSON.stringify({
         ...commonPayload,
-        subtitleLanguage: getEffectiveSubtitleLanguage(),
-      },
+        subtitleEngine,
+        subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
+        whisperModel: whisperModelSelect.value,
+        vadFilter: Boolean(vadFilterCheckbox.checked),
+      }),
     };
   }
 
   const batchMode = batchModeSelect.value;
-  const payload = {
-    ...commonPayload,
-    taskType: "batch",
-    batchMode,
-    audioFormat: audioFormatSelect.value,
-    videoQuality: videoQualitySelect.value,
-    subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
-  };
-
   return {
+    uploadMode: false,
+    endpoint: "/api/jobs",
     fallbackName: `youtube-batch-${batchMode}.zip`,
-    payload,
+    body: JSON.stringify({
+      ...commonPayload,
+      taskType: "batch",
+      batchMode,
+      audioFormat: audioFormatSelect.value,
+      videoQuality: videoQualitySelect.value,
+      subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
+      subtitleEngine: "youtube",
+      whisperModel: whisperModelSelect.value,
+      vadFilter: Boolean(vadFilterCheckbox.checked),
+    }),
   };
+}
+
+function buildRequestConfig() {
+  if (isUploadWhisperMode()) {
+    return buildUploadPayload();
+  }
+  return buildJsonPayload();
 }
 
 async function readErrorMessage(response, fallbackMessage) {
@@ -391,9 +536,30 @@ async function fetchDownload(downloadUrl, fallbackName) {
 }
 
 async function waitForJob(jobId, fallbackName) {
+  let reconnectAttempts = 0;
+
   while (true) {
-    const response = await fetch(`/api/jobs/${jobId}`);
+    let response;
+    try {
+      response = await fetch(`/api/jobs/${jobId}`);
+      reconnectAttempts = 0;
+    } catch (error) {
+      reconnectAttempts += 1;
+      setProgress(
+        Number(progressLabel.textContent.replace("%", "")) || 0,
+        "로컬 앱에 다시 연결하는 중입니다. 앱이 다시 켜지면 자동으로 이어집니다.",
+        "busy",
+      );
+      if (reconnectAttempts >= 300) {
+        throw error;
+      }
+      await sleep(2000);
+      continue;
+    }
     if (!response.ok) {
+      if (response.status === 404) {
+        clearActiveJob();
+      }
       throw new Error(await readErrorMessage(response, "작업 상태를 조회하지 못했습니다."));
     }
 
@@ -401,6 +567,7 @@ async function waitForJob(jobId, fallbackName) {
     setProgress(job.progress || 0, job.message || "처리 중입니다.", job.status || "processing", job.details || {});
 
     if (job.status === "failed") {
+      clearActiveJob();
       throw new Error(job.error || job.message || "작업이 실패했습니다.");
     }
 
@@ -417,37 +584,50 @@ async function waitForJob(jobId, fallbackName) {
   }
 }
 
+async function createJob(config) {
+  if (config.uploadMode) {
+    return fetch(config.endpoint, {
+      method: "POST",
+      body: config.body,
+    });
+  }
+
+  return fetch(config.endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: config.body,
+  });
+}
+
 async function handleSubmit(event) {
   event.preventDefault();
 
-  const config = buildPayload();
+  const config = buildRequestConfig();
+  clearActiveJob();
   setBusy(true);
-  setProgress(0, "작업을 준비하는 중입니다.", "busy", currentMode === "batch" ? { total: 0, completed: 0, failed: 0 } : {});
+  setProgress(0, "작업을 준비하고 있습니다.", "busy", currentMode === "batch" ? { total: 0, completed: 0, failed: 0 } : {});
   setStatus(`${MODE_CONFIG[currentMode].label} 작업을 시작합니다.`, "busy");
 
   try {
-    const createResponse = await fetch("/api/jobs", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(config.payload),
-    });
-
+    const createResponse = await createJob(config);
     if (!createResponse.ok) {
       throw new Error(await readErrorMessage(createResponse, "작업을 시작하지 못했습니다."));
     }
 
     const createdJob = await createResponse.json();
+    saveActiveJob(createdJob.jobId, config.fallbackName);
     setProgress(
       createdJob.progress || 0,
-      createdJob.message || "작업을 준비하는 중입니다.",
+      createdJob.message || "작업을 준비하고 있습니다.",
       createdJob.status || "queued",
-      createdJob.details || {}
+      createdJob.details || {},
     );
 
     const completedJob = await waitForJob(createdJob.jobId, config.fallbackName);
     const result = await fetchDownload(completedJob.downloadUrl, completedJob.filename);
+    clearActiveJob();
     setProgress(100, completedJob.message || MODE_CONFIG[currentMode].doneLabel, "success", completedJob.details || {});
     setStatus(`${MODE_CONFIG[currentMode].doneLabel} ${result.saveMessage}`, "success");
   } catch (error) {
@@ -459,10 +639,49 @@ async function handleSubmit(event) {
   }
 }
 
+async function restoreActiveJob() {
+  if (activeJobRestorePromise) {
+    return activeJobRestorePromise;
+  }
+
+  const activeJob = loadActiveJob();
+  if (!activeJob || !activeJob.jobId) {
+    return;
+  }
+
+  activeJobRestorePromise = (async () => {
+    if (typeof activeJob.mode === "string" && activeJob.mode in MODE_CONFIG) {
+      currentMode = activeJob.mode;
+      syncModeUi();
+    }
+
+    setBusy(true);
+    setProgress(0, "이전 작업에 다시 연결하는 중입니다.", "busy");
+    setStatus("이전 작업에 다시 연결하는 중입니다.", "busy");
+
+    try {
+      const completedJob = await waitForJob(activeJob.jobId, activeJob.fallbackName || "download.bin");
+      const result = await fetchDownload(completedJob.downloadUrl, completedJob.filename);
+      clearActiveJob();
+      setProgress(100, completedJob.message || MODE_CONFIG[currentMode].doneLabel, "success", completedJob.details || {});
+      setStatus(`${MODE_CONFIG[currentMode].doneLabel} ${result.saveMessage}`, "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "작업이 실패했습니다.";
+      setProgress(Number(progressLabel.textContent.replace("%", "")) || 0, message, "error");
+      setStatus(message, "error");
+    } finally {
+      setBusy(false);
+      activeJobRestorePromise = null;
+    }
+  })();
+
+  return activeJobRestorePromise;
+}
+
 if (typeof window.showDirectoryPicker !== "function") {
   folderButton.disabled = true;
   folderHelp.textContent =
-    "Chrome 또는 Edge에서는 폴더 직접 저장을 지원합니다. 그 외 브라우저에서는 기본 다운로드 폴더를 사용합니다.";
+    "Chrome 또는 Edge에서는 폴더 직접 저장을 지원합니다. 다른 브라우저에서는 기본 다운로드 폴더를 사용합니다.";
 }
 
 for (const button of modeButtons) {
@@ -474,6 +693,8 @@ for (const button of modeButtons) {
   });
 }
 
+subtitleEngineSelect.addEventListener("change", syncSubtitleUi);
+subtitleSourceSelect.addEventListener("change", syncSubtitleUi);
 subtitleLanguageSelect.addEventListener("change", syncSubtitleLanguageUi);
 batchModeSelect.addEventListener("change", syncModeUi);
 folderButton.addEventListener("click", handleFolderPick);
@@ -482,3 +703,4 @@ form.addEventListener("submit", handleSubmit);
 
 initializeTheme();
 syncModeUi();
+restoreActiveJob();

@@ -15,7 +15,14 @@ if (-not (Test-Path $python)) {
     --name "YouTubeAudioExtractor" `
     --collect-all anyio `
     --collect-all fastapi `
+    --collect-all faster_whisper `
+    --collect-all ctranslate2 `
+    --collect-all tokenizers `
+    --collect-all huggingface_hub `
+    --collect-all onnxruntime `
+    --collect-all av `
     --collect-all imageio_ffmpeg `
+    --collect-all multipart `
     --collect-all pydantic `
     --collect-all starlette `
     --collect-all yt_dlp `

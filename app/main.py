@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-import threading
-from pathlib import Path
+import os
+import shutil
 import sys
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from app.models import ExtractRequest, JobRequest, SubtitleRequest
+from app.services.app_state import get_job_work_dir
 from app.services.batch_extractor import BatchExtractionOptions, extract_batch
 from app.services.extraction_jobs import ExtractionJobStore
 from app.services.extractor import (
@@ -27,6 +31,16 @@ from app.services.extractor import (
 )
 from app.services.subtitle_extractor import SubtitleOptions, extract_subtitles
 from app.services.video_extractor import VideoExtractionOptions, extract_video
+from app.services.whisper_subtitle_extractor import (
+    LocalWhisperSubtitleOptions,
+    SUPPORTED_SUBTITLE_ENGINES,
+    SUPPORTED_WHISPER_MODELS,
+    WhisperSubtitleOptions,
+    extract_whisper_subtitles,
+    extract_whisper_subtitles_from_file,
+    validate_upload_audio_filename,
+)
+
 
 def resolve_static_dir() -> Path:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -37,11 +51,20 @@ def resolve_static_dir() -> Path:
 STATIC_DIR = resolve_static_dir()
 job_store = ExtractionJobStore()
 
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    if should_resume_jobs_on_startup():
+        resume_pending_jobs()
+    yield
+
+
 app = FastAPI(
     title="YouTube Multi Extractor",
     version="2.0.0",
     docs_url="/docs",
     redoc_url=None,
+    lifespan=app_lifespan,
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -63,6 +86,56 @@ def get_job_or_404(job_id: str, download_path_template: str) -> dict[str, object
     return job
 
 
+def should_resume_jobs_on_startup() -> bool:
+    if os.environ.get("APP_ENABLE_JOB_RECOVERY", "1") == "0":
+        return False
+    if "pytest" in sys.modules:
+        return False
+    return True
+
+
+def build_whisper_resume_details(
+    *,
+    work_dir: Path,
+    model: str,
+    language: str,
+    vad_filter: bool,
+    start_time: str | None,
+    end_time: str | None,
+    subtitle_source: str,
+    url: str | None = None,
+    source_name: str | None = None,
+    source_path: Path | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "taskType": "subtitle",
+        "subtitleEngine": "whisper",
+        "subtitleSource": subtitle_source,
+        "resumeSupported": True,
+        "workDir": str(work_dir),
+        "whisperModel": model,
+        "subtitleLanguage": language,
+        "vadFilter": vad_filter,
+        "startTime": start_time,
+        "endTime": end_time,
+    }
+    if url:
+        payload["url"] = url
+    if source_name:
+        payload["sourceName"] = source_name
+    if source_path is not None:
+        payload["sourcePath"] = str(source_path)
+    return payload
+
+
+def start_background_job(target, *args) -> None:
+    threading.Thread(
+        target=target,
+        args=args,
+        daemon=True,
+    ).start()
+
+
 def dispatch_job(job_id: str, payload: JobRequest) -> None:
     batch_details = {
         "taskType": payload.task_type,
@@ -71,7 +144,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
         "completed": 0,
         "failed": 0,
     }
-    latest_batch_message = "배치 작업을 준비하는 중입니다."
+    latest_batch_message = "Batch job is being prepared."
 
     try:
         if payload.task_type == "audio":
@@ -84,7 +157,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                 ),
                 progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
             )
-            success_message = "오디오 추출이 완료되었습니다."
+            success_message = "Audio extraction completed."
             details = {"taskType": payload.task_type}
         elif payload.task_type == "song_mp3":
             result = extract_song_mp3(
@@ -95,7 +168,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                 ),
                 progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
             )
-            success_message = "노래 MP3 추출이 완료되었습니다."
+            success_message = "Song MP3 extraction completed."
             details = {"taskType": payload.task_type}
         elif payload.task_type == "video":
             result = extract_video(
@@ -107,21 +180,39 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                 ),
                 progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
             )
-            success_message = "영상 추출이 완료되었습니다."
+            success_message = "Video extraction completed."
             details = {"taskType": payload.task_type}
         elif payload.task_type == "subtitle":
-            job_store.update_progress(job_id, 10, "자막을 준비하는 중입니다.")
-            result = extract_subtitles(
-                SubtitleOptions(
-                    url=payload.url,
-                    subtitle_language=payload.subtitle_language,
-                    start_time=payload.start_time,
-                    end_time=payload.end_time,
+            job_store.update_progress(job_id, 10, "Preparing subtitle extraction.")
+            if payload.subtitle_engine == "whisper":
+                result = extract_whisper_subtitles(
+                    WhisperSubtitleOptions(
+                        url=payload.url,
+                        model=payload.whisper_model,
+                        language=payload.subtitle_language,
+                        vad_filter=payload.vad_filter,
+                        start_time=payload.start_time,
+                        end_time=payload.end_time,
+                    ),
+                    progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
                 )
-            )
-            success_message = "자막 추출이 완료되었습니다."
-            details = {"taskType": payload.task_type}
+                success_message = "Whisper subtitle extraction completed."
+            else:
+                result = extract_subtitles(
+                    SubtitleOptions(
+                        url=payload.url,
+                        subtitle_language=payload.subtitle_language,
+                        start_time=payload.start_time,
+                        end_time=payload.end_time,
+                    )
+                )
+                success_message = "Subtitle extraction completed."
+            details = {
+                "taskType": payload.task_type,
+                "subtitleEngine": payload.subtitle_engine,
+            }
         elif payload.task_type == "batch":
+
             def batch_progress(progress: int, message: str) -> None:
                 nonlocal latest_batch_message
                 latest_batch_message = message
@@ -144,10 +235,10 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                 progress_callback=batch_progress,
                 status_callback=batch_status,
             )
-            success_message = "배치 다운로드가 완료되었습니다."
+            success_message = "Batch download completed."
             details = batch_details | {"taskType": payload.task_type}
         else:
-            raise ExtractionInputError("지원하지 않는 작업 유형입니다.")
+            raise ExtractionInputError("Unsupported task type.")
     except ExtractionInputError as exc:
         job_store.fail_job(job_id, str(exc), details=batch_details if payload.task_type == "batch" else None)
     except ExtractionRuntimeError as exc:
@@ -155,7 +246,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
     except Exception:
         job_store.fail_job(
             job_id,
-            "작업 중 예기치 않은 오류가 발생했습니다.",
+            "An unexpected error occurred while processing the request.",
             details=batch_details if payload.task_type == "batch" else None,
         )
     else:
@@ -178,9 +269,121 @@ def run_audio_job(job_id: str, payload: ExtractRequest) -> None:
     except ExtractionRuntimeError as exc:
         job_store.fail_job(job_id, str(exc))
     except Exception:
-        job_store.fail_job(job_id, "작업 중 예기치 않은 오류가 발생했습니다.")
+        job_store.fail_job(job_id, "An unexpected error occurred while processing the request.")
     else:
-        job_store.complete_job(job_id, result, message="오디오 추출이 완료되었습니다.", details={"taskType": "audio"})
+        job_store.complete_job(job_id, result, message="Audio extraction completed.", details={"taskType": "audio"})
+
+
+def run_whisper_url_job(
+    job_id: str,
+    options: WhisperSubtitleOptions,
+    work_dir: Path,
+) -> None:
+    try:
+        result = extract_whisper_subtitles(
+            options,
+            progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
+            temp_dir=work_dir,
+            resume_state_callback=lambda details: job_store.merge_details(job_id, details),
+        )
+    except ExtractionInputError as exc:
+        job_store.fail_job(job_id, str(exc))
+    except ExtractionRuntimeError as exc:
+        job_store.fail_job(job_id, str(exc))
+    except Exception as exc:
+        job_store.fail_job(job_id, f"An unexpected error occurred while processing the request: {exc}")
+    else:
+        job_store.complete_job(
+            job_id,
+            result,
+            message="Whisper subtitle extraction completed.",
+            details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "youtube_url"},
+        )
+
+
+def run_uploaded_whisper_job(
+    job_id: str,
+    source_path: Path,
+    source_name: str,
+    options: LocalWhisperSubtitleOptions,
+    temp_dir: Path,
+) -> None:
+    try:
+        result = extract_whisper_subtitles_from_file(
+            source_path,
+            source_name,
+            options,
+            temp_dir=temp_dir,
+            progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
+            resume_state_callback=lambda details: job_store.merge_details(job_id, details),
+        )
+    except ExtractionInputError as exc:
+        job_store.fail_job(job_id, str(exc))
+    except ExtractionRuntimeError as exc:
+        job_store.fail_job(job_id, str(exc))
+    except Exception as exc:
+        job_store.fail_job(job_id, f"An unexpected error occurred while processing the uploaded audio: {exc}")
+    else:
+        job_store.complete_job(
+            job_id,
+            result,
+            message="Whisper subtitle extraction completed.",
+            details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "upload"},
+        )
+
+
+def resume_pending_jobs() -> None:
+    for job in job_store.list_jobs(statuses={"queued", "processing"}):
+        details = job.details
+        if not details.get("resumeSupported"):
+            job_store.fail_job(job.job_id, "This in-progress job cannot be resumed after app restart.")
+            continue
+
+        if details.get("taskType") != "subtitle" or details.get("subtitleEngine") != "whisper":
+            job_store.fail_job(job.job_id, "This in-progress job cannot be resumed after app restart.")
+            continue
+
+        work_dir_value = details.get("workDir")
+        if not isinstance(work_dir_value, str) or not work_dir_value:
+            job_store.fail_job(job.job_id, "The resumable job is missing its working directory.")
+            continue
+
+        work_dir = Path(work_dir_value)
+        job_store.update_progress(job.job_id, max(job.progress, 1), "Recovering Whisper job after app restart.", {"recovered": True})
+
+        if details.get("subtitleSource") == "upload":
+            source_name = str(details.get("sourceName") or "uploaded-audio")
+            source_path_value = details.get("sourcePath")
+            source_path = Path(str(source_path_value)) if source_path_value else work_dir / "missing-source"
+            start_background_job(
+                run_uploaded_whisper_job,
+                job.job_id,
+                source_path,
+                source_name,
+                LocalWhisperSubtitleOptions(
+                    model=str(details.get("whisperModel") or "base"),
+                    language=str(details.get("subtitleLanguage") or "ko"),
+                    vad_filter=bool(details.get("vadFilter", True)),
+                    start_time=str(details.get("startTime")) if details.get("startTime") is not None else None,
+                    end_time=str(details.get("endTime")) if details.get("endTime") is not None else None,
+                ),
+                work_dir,
+            )
+            continue
+
+        start_background_job(
+            run_whisper_url_job,
+            job.job_id,
+            WhisperSubtitleOptions(
+                url=str(details.get("url") or ""),
+                model=str(details.get("whisperModel") or "base"),
+                language=str(details.get("subtitleLanguage") or "ko"),
+                vad_filter=bool(details.get("vadFilter", True)),
+                start_time=str(details.get("startTime")) if details.get("startTime") is not None else None,
+                end_time=str(details.get("endTime")) if details.get("endTime") is not None else None,
+            ),
+            work_dir,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -198,25 +401,130 @@ def healthcheck() -> dict[str, object]:
         "videoQualities": list(SUPPORTED_VIDEO_QUALITIES),
         "taskTypes": ["audio", "song_mp3", "video", "subtitle", "batch"],
         "batchModes": ["audio", "song_mp3", "video", "subtitle"],
+        "subtitleEngines": list(SUPPORTED_SUBTITLE_ENGINES),
+        "whisperModels": list(SUPPORTED_WHISPER_MODELS),
+        "subtitleSources": ["youtube_url", "audio_file"],
+        "recommendedWhisperModels": {
+            "default": "base",
+            "longVideo": "base",
+            "balanced": "small",
+            "highSpec": "large-v3-turbo",
+        },
     }
 
 
 @app.post("/api/jobs", status_code=202)
 def create_job(payload: JobRequest) -> dict[str, object]:
     details = {"taskType": payload.task_type}
+    if payload.task_type == "subtitle":
+        details["subtitleEngine"] = payload.subtitle_engine
     if payload.task_type == "batch":
         details.update({"batchMode": payload.batch_mode, "total": 0, "completed": 0, "failed": 0})
 
     job = job_store.create_job(
-        message="작업을 준비하는 중입니다.",
+        message="Job is being prepared.",
         details=details,
         download_path_template="/api/jobs/{job_id}/download",
     )
-    threading.Thread(
-        target=dispatch_job,
-        args=(str(job["jobId"]), payload),
-        daemon=True,
-    ).start()
+    job_id = str(job["jobId"])
+
+    if payload.task_type == "subtitle" and payload.subtitle_engine == "whisper":
+        work_dir = get_job_work_dir(job_id)
+        job_store.merge_details(
+            job_id,
+            build_whisper_resume_details(
+                work_dir=work_dir,
+                model=payload.whisper_model,
+                language=payload.subtitle_language,
+                vad_filter=payload.vad_filter,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+                subtitle_source="youtube_url",
+                url=payload.url,
+            ),
+        )
+        start_background_job(
+            run_whisper_url_job,
+            job_id,
+            WhisperSubtitleOptions(
+                url=payload.url,
+                model=payload.whisper_model,
+                language=payload.subtitle_language,
+                vad_filter=payload.vad_filter,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+            ),
+            work_dir,
+        )
+        return job
+
+    start_background_job(dispatch_job, job_id, payload)
+    return job
+
+
+@app.post("/api/subtitles/upload/jobs", status_code=202)
+async def create_uploaded_whisper_job(
+    file: UploadFile = File(...),
+    whisper_model: str = Form("base", alias="whisperModel"),
+    subtitle_language: str = Form("ko", alias="subtitleLanguage"),
+    vad_filter: bool = Form(True, alias="vadFilter"),
+    start_time: str | None = Form(None, alias="startTime"),
+    end_time: str | None = Form(None, alias="endTime"),
+) -> dict[str, object]:
+    try:
+        source_name = validate_upload_audio_filename(file.filename or "")
+    except ExtractionInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        options = LocalWhisperSubtitleOptions(
+            model=whisper_model,
+            language=subtitle_language,
+            vad_filter=vad_filter,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except ExtractionInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = job_store.create_job(
+        message="Uploaded audio is being prepared.",
+        details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "upload"},
+        download_path_template="/api/jobs/{job_id}/download",
+    )
+    job_id = str(job["jobId"])
+    work_dir = get_job_work_dir(job_id)
+
+    try:
+        suffix = Path(source_name).suffix.lower()
+        source_path = work_dir / f"uploaded-source{suffix}"
+        with source_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as exc:
+        job_store.delete_job(job_id)
+        raise HTTPException(status_code=400, detail="Failed to store the uploaded audio file.") from exc
+    finally:
+        await file.close()
+
+    if not source_path.exists() or source_path.stat().st_size == 0:
+        job_store.delete_job(job_id)
+        raise HTTPException(status_code=400, detail="The uploaded audio file is empty.")
+
+    job_store.merge_details(
+        job_id,
+        build_whisper_resume_details(
+            work_dir=work_dir,
+            model=options.model,
+            language=options.language,
+            vad_filter=options.vad_filter,
+            start_time=options.start_time,
+            end_time=options.end_time,
+            subtitle_source="upload",
+            source_name=source_name,
+            source_path=source_path,
+        ),
+    )
+    start_background_job(run_uploaded_whisper_job, job_id, source_path, source_name, options, work_dir)
     return job
 
 
@@ -237,7 +545,7 @@ def download_job(job_id: str) -> FileResponse:
 @app.post("/api/extract/jobs", status_code=202)
 def create_extract_job(payload: ExtractRequest) -> dict[str, object]:
     job = job_store.create_job(
-        message="오디오 작업을 준비하는 중입니다.",
+        message="Audio extraction is being prepared.",
         details={"taskType": "audio"},
         download_path_template="/api/extract/jobs/{job_id}/download",
     )
@@ -266,14 +574,26 @@ def download_extract_job(job_id: str) -> FileResponse:
 @app.post("/api/subtitles")
 def extract_subtitles_endpoint(payload: SubtitleRequest) -> FileResponse:
     try:
-        result = extract_subtitles(
-            SubtitleOptions(
-                url=payload.url,
-                subtitle_language=payload.subtitle_language,
-                start_time=payload.start_time,
-                end_time=payload.end_time,
+        if payload.subtitle_engine == "whisper":
+            result = extract_whisper_subtitles(
+                WhisperSubtitleOptions(
+                    url=payload.url,
+                    model=payload.whisper_model,
+                    language=payload.subtitle_language,
+                    vad_filter=payload.vad_filter,
+                    start_time=payload.start_time,
+                    end_time=payload.end_time,
+                )
             )
-        )
+        else:
+            result = extract_subtitles(
+                SubtitleOptions(
+                    url=payload.url,
+                    subtitle_language=payload.subtitle_language,
+                    start_time=payload.start_time,
+                    end_time=payload.end_time,
+                )
+            )
     except ExtractionInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ExtractionRuntimeError as exc:
