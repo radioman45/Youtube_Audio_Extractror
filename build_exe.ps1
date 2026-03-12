@@ -10,22 +10,19 @@ if (-not (Test-Path $python)) {
 
 & $python -m PyInstaller `
     --noconfirm `
-    --clean `
-    --onefile `
-    --name "YouTubeAudioExtractor" `
-    --collect-all anyio `
-    --collect-all fastapi `
+    --onedir `
+    --name "YouTubeAudioExtractorDesktop" `
     --collect-all faster_whisper `
     --collect-all ctranslate2 `
     --collect-all tokenizers `
-    --collect-all huggingface_hub `
-    --collect-all onnxruntime `
+    --collect-data huggingface_hub `
+    --collect-binaries onnxruntime `
+    --collect-data onnxruntime `
     --collect-all av `
     --collect-all imageio_ffmpeg `
-    --collect-all multipart `
-    --collect-all pydantic `
-    --collect-all starlette `
     --collect-all yt_dlp `
-    --collect-all uvicorn `
-    --add-data "app\static;app\static" `
     launcher.py
+
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

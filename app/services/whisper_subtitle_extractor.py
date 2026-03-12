@@ -71,15 +71,20 @@ WHISPER_MODEL_REPOSITORIES: dict[str, str] = {
     "large-v3": "Systran/faster-whisper-large-v3",
     "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
 }
-WHISPER_SUPPORT_FILE_PATTERNS: tuple[str, ...] = (
+WHISPER_REQUIRED_SUPPORT_FILES: tuple[str, ...] = (
     "config.json",
-    "preprocessor_config.json",
     "tokenizer.json",
-    "vocabulary.*",
 )
+WHISPER_OPTIONAL_SUPPORT_FILES: tuple[str, ...] = ("preprocessor_config.json",)
+WHISPER_FALLBACK_VOCABULARY_FILENAMES: tuple[str, ...] = ("vocabulary.txt", "vocabulary.json")
 LOCAL_ONLY_ENV_VAR = "APP_WHISPER_LOCAL_ONLY"
 WHISPER_DEVICE_ENV_VAR = "APP_WHISPER_DEVICE"
+WHISPER_HUB_ENDPOINTS_ENV_VAR = "APP_WHISPER_HUB_ENDPOINTS"
 SUPPORTED_WHISPER_DEVICES: tuple[str, ...] = ("cpu", "auto", "cuda")
+DEFAULT_WHISPER_HUB_ENDPOINTS: tuple[str, ...] = (
+    "https://huggingface.co",
+    "https://hf-mirror.com",
+)
 WHISPER_SAMPLE_RATE = 16000
 WHISPER_CHANNELS = 1
 WHISPER_CHUNK_SECONDS = 30 * 60
@@ -374,6 +379,52 @@ def resolve_whisper_device() -> str:
     return configured
 
 
+def get_whisper_download_endpoints() -> tuple[str, ...]:
+    configured = os.environ.get(WHISPER_HUB_ENDPOINTS_ENV_VAR, "")
+    raw_endpoints = configured.replace(";", ",").replace("\n", ",").split(",") if configured else list(DEFAULT_WHISPER_HUB_ENDPOINTS)
+
+    normalized: list[str] = []
+    for endpoint in raw_endpoints:
+        cleaned = endpoint.strip().rstrip("/")
+        if not cleaned or cleaned in normalized:
+            continue
+        normalized.append(cleaned)
+
+    if normalized:
+        return tuple(normalized)
+    return DEFAULT_WHISPER_HUB_ENDPOINTS
+
+
+def describe_whisper_download_endpoint(endpoint: str) -> str:
+    normalized = endpoint.rstrip("/")
+    if normalized == DEFAULT_WHISPER_HUB_ENDPOINTS[0]:
+        return "the official Hugging Face Hub"
+    if normalized == DEFAULT_WHISPER_HUB_ENDPOINTS[1]:
+        return "the alternate Whisper mirror"
+    return normalized
+
+
+def build_whisper_http_verify():
+    try:
+        import ssl
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        return True
+
+
+def configure_huggingface_hub_http_client() -> None:
+    try:
+        import httpx
+        from huggingface_hub import set_client_factory
+
+        verify = build_whisper_http_verify()
+        set_client_factory(lambda: httpx.Client(follow_redirects=True, timeout=None, verify=verify))
+    except Exception:
+        return
+
+
 def get_whisper_repository_id(model: str) -> str:
     try:
         return WHISPER_MODEL_REPOSITORIES[model]
@@ -392,8 +443,6 @@ def get_whisper_model_cache_dir(model: str) -> Path:
 def has_complete_local_whisper_model(model_dir: Path) -> bool:
     if not (model_dir / "config.json").exists():
         return False
-    if not (model_dir / "preprocessor_config.json").exists():
-        return False
     if not (model_dir / "tokenizer.json").exists():
         return False
     if not (model_dir / "model.bin").exists():
@@ -401,52 +450,60 @@ def has_complete_local_whisper_model(model_dir: Path) -> bool:
     return any(model_dir.glob("vocabulary.*"))
 
 
-def download_whisper_support_files(repo_id: str, model_dir: Path) -> None:
-    from huggingface_hub import snapshot_download
+def summarize_whisper_download_exception(exc: Exception) -> str:
+    parts: list[str] = []
+    current: Exception | None = exc
+    while current is not None:
+        text = str(current).strip()
+        if text and text not in parts:
+            parts.append(text)
+        next_exc = current.__cause__ if isinstance(current.__cause__, Exception) else None
+        if next_exc is None and isinstance(current.__context__, Exception):
+            next_exc = current.__context__
+        current = next_exc
 
-    model_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id,
-        allow_patterns=list(WHISPER_SUPPORT_FILE_PATTERNS),
-        local_dir=str(model_dir),
-        local_dir_use_symlinks=False,
-    )
+    summary = " | ".join(parts[:3])
+    lowered = summary.lower()
+    if "website blocking" in lowered or "urlblocked" in lowered:
+        return "The network is blocking access to the official Hugging Face host."
+    if "certificate_verify_failed" in lowered:
+        return "TLS certificate validation failed while connecting to the model host."
+    return summary or exc.__class__.__name__
 
 
-def download_whisper_model_binary(
+def download_whisper_repository_file(
     *,
     repo_id: str,
-    model: str,
+    filename: str,
+    endpoint: str,
     target_path: Path,
+    allow_resume: bool = False,
     progress_callback: ProgressCallback | None = None,
-) -> None:
+    progress_model_name: str | None = None,
+) -> bool:
     import httpx
     from huggingface_hub import hf_hub_url
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target_path.with_suffix(".bin.part")
-    existing_bytes = temp_path.stat().st_size if temp_path.exists() else 0
-
+    temp_path = target_path.with_suffix(target_path.suffix + ".part")
+    existing_bytes = temp_path.stat().st_size if allow_resume and temp_path.exists() else 0
     headers: dict[str, str] = {}
     if existing_bytes > 0:
         headers["Range"] = f"bytes={existing_bytes}-"
 
-    with httpx.Client(follow_redirects=True, timeout=None) as client:
-        with client.stream("GET", hf_hub_url(repo_id, "model.bin"), headers=headers) as response:
+    with httpx.Client(follow_redirects=True, timeout=None, verify=build_whisper_http_verify()) as client:
+        with client.stream("GET", hf_hub_url(repo_id, filename, endpoint=endpoint), headers=headers) as response:
+            if response.status_code == 404:
+                return False
             response.raise_for_status()
 
-            total_bytes = 0
-            mode = "wb"
-            if response.status_code == 206 and existing_bytes > 0:
-                total_bytes = existing_bytes + int(response.headers.get("Content-Length") or 0)
-                mode = "ab"
-            else:
-                existing_bytes = 0
-                total_bytes = int(response.headers.get("Content-Length") or 0)
-                if temp_path.exists():
-                    temp_path.unlink()
-
+            total_bytes = int(response.headers.get("Content-Length") or 0)
             written_bytes = existing_bytes
+            mode = "ab" if existing_bytes > 0 and response.status_code == 206 else "wb"
+            if mode == "wb" and temp_path.exists():
+                temp_path.unlink()
+                written_bytes = 0
+
             last_reported_percent = -1
             with temp_path.open(mode) as handle:
                 for chunk in response.iter_bytes(chunk_size=1024 * 1024):
@@ -455,10 +512,11 @@ def download_whisper_model_binary(
                     handle.write(chunk)
                     written_bytes += len(chunk)
 
-                    if total_bytes <= 0:
+                    if progress_callback is None or progress_model_name is None or total_bytes <= 0:
                         continue
 
-                    percent = int((written_bytes / total_bytes) * 100)
+                    total_with_existing = total_bytes + existing_bytes if response.status_code == 206 and existing_bytes > 0 else total_bytes
+                    percent = int((written_bytes / total_with_existing) * 100)
                     if percent == last_reported_percent:
                         continue
                     last_reported_percent = percent
@@ -466,10 +524,104 @@ def download_whisper_model_binary(
                     notify_progress(
                         progress_callback,
                         mapped_progress,
-                        f"Downloading Whisper model '{model}' ({percent}%).",
+                        f"Downloading Whisper model '{progress_model_name}' ({percent}%).",
                     )
 
     temp_path.replace(target_path)
+    return True
+
+
+def resolve_whisper_vocabulary_filenames(repo_id: str, endpoint: str) -> tuple[str, ...]:
+    import httpx
+
+    api_url = f"{endpoint.rstrip('/')}/api/models/{repo_id}"
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0, verify=build_whisper_http_verify()) as client:
+            response = client.get(api_url)
+            response.raise_for_status()
+    except Exception:
+        return WHISPER_FALLBACK_VOCABULARY_FILENAMES
+
+    payload = response.json()
+    siblings = payload.get("siblings")
+    if not isinstance(siblings, list):
+        return WHISPER_FALLBACK_VOCABULARY_FILENAMES
+
+    filenames: list[str] = []
+    for sibling in siblings:
+        if not isinstance(sibling, dict):
+            continue
+        name = str(sibling.get("rfilename") or "").strip()
+        if name.startswith("vocabulary.") and name not in filenames:
+            filenames.append(name)
+
+    if filenames:
+        return tuple(filenames)
+    return WHISPER_FALLBACK_VOCABULARY_FILENAMES
+
+
+def download_whisper_support_files(repo_id: str, model_dir: Path, endpoint: str) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename in WHISPER_REQUIRED_SUPPORT_FILES:
+        target_path = model_dir / filename
+        if target_path.exists():
+            continue
+        downloaded = download_whisper_repository_file(
+            repo_id=repo_id,
+            filename=filename,
+            endpoint=endpoint,
+            target_path=target_path,
+        )
+        if not downloaded:
+            raise ExtractionRuntimeError(f"Required Whisper support file '{filename}' was not found.")
+
+    for filename in WHISPER_OPTIONAL_SUPPORT_FILES:
+        target_path = model_dir / filename
+        if target_path.exists():
+            continue
+        download_whisper_repository_file(
+            repo_id=repo_id,
+            filename=filename,
+            endpoint=endpoint,
+            target_path=target_path,
+        )
+
+    if any(model_dir.glob("vocabulary.*")):
+        return
+
+    for filename in resolve_whisper_vocabulary_filenames(repo_id, endpoint):
+        download_whisper_repository_file(
+            repo_id=repo_id,
+            filename=filename,
+            endpoint=endpoint,
+            target_path=model_dir / Path(filename).name,
+        )
+        if any(model_dir.glob("vocabulary.*")):
+            return
+
+    raise ExtractionRuntimeError("Required Whisper vocabulary files were not found.")
+
+
+def download_whisper_model_binary(
+    *,
+    repo_id: str,
+    model: str,
+    endpoint: str,
+    target_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
+    downloaded = download_whisper_repository_file(
+        repo_id=repo_id,
+        filename="model.bin",
+        endpoint=endpoint,
+        target_path=target_path,
+        allow_resume=True,
+        progress_callback=progress_callback,
+        progress_model_name=model,
+    )
+    if not downloaded:
+        raise ExtractionRuntimeError("Required Whisper model binary was not found.")
 
 
 def ensure_local_whisper_model_directory(
@@ -488,16 +640,37 @@ def ensure_local_whisper_model_directory(
         90,
         f"Preparing Whisper model '{model}' for local use.",
     )
-    download_whisper_support_files(repo_id, model_dir)
-    if not (model_dir / "model.bin").exists():
-        download_whisper_model_binary(
-            repo_id=repo_id,
-            model=model,
-            target_path=model_dir / "model.bin",
-            progress_callback=progress_callback,
-        )
+    endpoint_errors: list[str] = []
+    for index, endpoint in enumerate(get_whisper_download_endpoints()):
+        if index > 0:
+            notify_progress(
+                progress_callback,
+                90,
+                f"Retrying Whisper model '{model}' with {describe_whisper_download_endpoint(endpoint)}.",
+            )
+
+        try:
+            download_whisper_support_files(repo_id, model_dir, endpoint)
+            if not (model_dir / "model.bin").exists():
+                download_whisper_model_binary(
+                    repo_id=repo_id,
+                    model=model,
+                    endpoint=endpoint,
+                    target_path=model_dir / "model.bin",
+                    progress_callback=progress_callback,
+                )
+        except Exception as exc:
+            endpoint_errors.append(
+                f"{describe_whisper_download_endpoint(endpoint)}: {summarize_whisper_download_exception(exc)}"
+            )
+            continue
+
+        if has_complete_local_whisper_model(model_dir):
+            return model_dir
 
     if not has_complete_local_whisper_model(model_dir):
+        if endpoint_errors:
+            raise ExtractionRuntimeError(" ; ".join(endpoint_errors))
         raise ExtractionRuntimeError(f"Whisper model '{model}' was downloaded incompletely.")
 
     return model_dir
@@ -517,6 +690,7 @@ def load_whisper_model(
     model: WhisperModelName,
     progress_callback: ProgressCallback | None = None,
 ):
+    configure_huggingface_hub_http_client()
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -556,8 +730,9 @@ def load_whisper_model(
             model_dir = ensure_local_whisper_model_directory(model, progress_callback=progress_callback)
             downloaded_model = WhisperModel(str(model_dir), device=device)
         except Exception as download_exc:
+            detail = summarize_whisper_download_exception(download_exc)
             raise ExtractionRuntimeError(
-                f"Whisper model '{model}' could not be downloaded. Check internet access, disk space, or choose a smaller model like 'base'."
+                f"Whisper model '{model}' could not be downloaded automatically. {detail}"
             ) from download_exc
 
     notify_progress(progress_callback, 92, f"Whisper model '{model}' is ready.")

@@ -9,14 +9,17 @@ from app.services.whisper_subtitle_extractor import (
     LocalWhisperSubtitleOptions,
     WhisperSubtitleOptions,
     collect_transcribed_cues,
+    ensure_local_whisper_model_directory,
     extract_whisper_subtitles,
     extract_whisper_subtitles_from_file,
+    get_whisper_download_endpoints,
     get_whisper_chunk_cues_path,
     get_whisper_resume_state_path,
     load_whisper_model,
     normalize_whisper_model,
     resolve_whisper_device,
     save_whisper_cues,
+    has_complete_local_whisper_model,
     validate_upload_audio_filename,
 )
 
@@ -90,9 +93,30 @@ def test_resolve_whisper_device_rejects_unknown_value(monkeypatch):
     assert resolve_whisper_device() == "cpu"
 
 
+def test_get_whisper_download_endpoints_defaults(monkeypatch):
+    monkeypatch.delenv("APP_WHISPER_HUB_ENDPOINTS", raising=False)
+    assert get_whisper_download_endpoints() == ("https://huggingface.co", "https://hf-mirror.com")
+
+
+def test_get_whisper_download_endpoints_honors_env(monkeypatch):
+    monkeypatch.setenv("APP_WHISPER_HUB_ENDPOINTS", " https://mirror-a.example ; https://mirror-b.example,https://mirror-a.example ")
+    assert get_whisper_download_endpoints() == ("https://mirror-a.example", "https://mirror-b.example")
+
+
 def test_validate_upload_audio_filename_rejects_unsupported_extension():
     with pytest.raises(ExtractionInputError):
         validate_upload_audio_filename("notes.txt")
+
+
+def test_has_complete_local_whisper_model_allows_missing_preprocessor(tmp_path: Path):
+    model_dir = tmp_path / "base"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "vocabulary.txt").write_text("ok", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"model")
+
+    assert has_complete_local_whisper_model(model_dir) is True
 
 
 def test_extract_whisper_subtitles_creates_srt(monkeypatch, tmp_path: Path):
@@ -323,6 +347,51 @@ def test_load_whisper_model_retries_with_direct_download(monkeypatch, tmp_path: 
     assert model == {"model": str(manual_dir)}
     assert fake_loader.calls == [("base", True), ("base", False), (str(manual_dir), None)]
     assert any("Retrying with direct download" in message for _, message in progress_updates)
+
+
+def test_ensure_local_whisper_model_directory_retries_alternate_endpoint(monkeypatch, tmp_path: Path):
+    model_dir = tmp_path / "cache" / "base"
+    progress_updates: list[tuple[int, str]] = []
+
+    monkeypatch.setattr(
+        "app.services.whisper_subtitle_extractor.get_whisper_model_cache_dir",
+        lambda _model: model_dir,
+    )
+    monkeypatch.setattr(
+        "app.services.whisper_subtitle_extractor.get_whisper_download_endpoints",
+        lambda: ("https://huggingface.co", "https://hf-mirror.com"),
+    )
+
+    def fake_support_files(repo_id: str, target_dir: Path, endpoint: str):
+        assert repo_id == "Systran/faster-whisper-base"
+        if endpoint == "https://huggingface.co":
+            raise ExtractionRuntimeError("Website Blocking")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("config.json", "preprocessor_config.json", "tokenizer.json", "vocabulary.txt"):
+            (target_dir / name).write_text("ok", encoding="utf-8")
+
+    def fake_model_binary(*, endpoint: str, target_path: Path, **_kwargs):
+        if endpoint == "https://huggingface.co":
+            raise ExtractionRuntimeError("Website Blocking")
+        target_path.write_bytes(b"model")
+
+    monkeypatch.setattr(
+        "app.services.whisper_subtitle_extractor.download_whisper_support_files",
+        fake_support_files,
+    )
+    monkeypatch.setattr(
+        "app.services.whisper_subtitle_extractor.download_whisper_model_binary",
+        fake_model_binary,
+    )
+
+    resolved_dir = ensure_local_whisper_model_directory(
+        "base",
+        progress_callback=lambda progress, message: progress_updates.append((progress, message)),
+    )
+
+    assert resolved_dir == model_dir
+    assert (model_dir / "model.bin").exists()
+    assert any("alternate Whisper mirror" in message for _, message in progress_updates)
 
 
 def test_collect_transcribed_cues_wraps_cuda_runtime_error(tmp_path: Path):

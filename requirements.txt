@@ -5,4 +5,7 @@ imageio-ffmpeg
 faster-whisper
 python-multipart
 httpx
+PySide6
+truststore
+pyinstaller
 pytest

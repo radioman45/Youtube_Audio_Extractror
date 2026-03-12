@@ -11,6 +11,5 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
-echo Starting YouTube Multi Extractor on http://127.0.0.1:8000
-echo Press Ctrl+C to stop the server.
-".venv\Scripts\python.exe" -m app.main
+echo Starting YouTube Multi Extractor Desktop
+".venv\Scripts\python.exe" launcher.py
