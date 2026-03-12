@@ -43,6 +43,7 @@ class BatchExtractionOptions:
     audio_format: str = "mp3"
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
+    subtitle_format: str = "timestamped"
     start_time: str | None = None
     end_time: str | None = None
 
@@ -196,6 +197,7 @@ def extract_batch(
                         SubtitleOptions(
                             url=entry_url,
                             subtitle_language=options.subtitle_language,
+                            subtitle_format=options.subtitle_format,
                             start_time=options.start_time,
                             end_time=options.end_time,
                         )

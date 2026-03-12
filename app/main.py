@@ -29,15 +29,17 @@ from app.services.extractor import (
     extract_audio,
     extract_song_mp3,
 )
-from app.services.subtitle_extractor import SubtitleOptions, extract_subtitles
+from app.services.subtitle_extractor import SUPPORTED_SUBTITLE_FORMATS, SubtitleOptions, extract_subtitles
 from app.services.video_extractor import VideoExtractionOptions, extract_video
 from app.services.whisper_subtitle_extractor import (
     LocalWhisperSubtitleOptions,
     SUPPORTED_SUBTITLE_ENGINES,
+    SUPPORTED_WHISPER_DEVICES,
     SUPPORTED_WHISPER_MODELS,
     WhisperSubtitleOptions,
     extract_whisper_subtitles,
     extract_whisper_subtitles_from_file,
+    normalize_local_whisper_options,
     validate_upload_audio_filename,
 )
 
@@ -98,7 +100,9 @@ def build_whisper_resume_details(
     *,
     work_dir: Path,
     model: str,
+    whisper_device: str,
     language: str,
+    subtitle_format: str,
     vad_filter: bool,
     start_time: str | None,
     end_time: str | None,
@@ -114,7 +118,9 @@ def build_whisper_resume_details(
         "resumeSupported": True,
         "workDir": str(work_dir),
         "whisperModel": model,
+        "whisperDevice": whisper_device,
         "subtitleLanguage": language,
+        "subtitleFormat": subtitle_format,
         "vadFilter": vad_filter,
         "startTime": start_time,
         "endTime": end_time,
@@ -190,6 +196,8 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                         url=payload.url,
                         model=payload.whisper_model,
                         language=payload.subtitle_language,
+                        subtitle_format=payload.subtitle_format,
+                        device=payload.whisper_device,
                         vad_filter=payload.vad_filter,
                         start_time=payload.start_time,
                         end_time=payload.end_time,
@@ -202,6 +210,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                     SubtitleOptions(
                         url=payload.url,
                         subtitle_language=payload.subtitle_language,
+                        subtitle_format=payload.subtitle_format,
                         start_time=payload.start_time,
                         end_time=payload.end_time,
                     )
@@ -210,7 +219,10 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
             details = {
                 "taskType": payload.task_type,
                 "subtitleEngine": payload.subtitle_engine,
+                "subtitleFormat": payload.subtitle_format,
             }
+            if payload.subtitle_engine == "whisper":
+                details["whisperDevice"] = payload.whisper_device
         elif payload.task_type == "batch":
 
             def batch_progress(progress: int, message: str) -> None:
@@ -229,6 +241,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                     audio_format=payload.audio_format,
                     video_quality=payload.video_quality,
                     subtitle_language=payload.subtitle_language,
+                    subtitle_format=payload.subtitle_format,
                     start_time=payload.start_time,
                     end_time=payload.end_time,
                 ),
@@ -297,7 +310,13 @@ def run_whisper_url_job(
             job_id,
             result,
             message="Whisper subtitle extraction completed.",
-            details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "youtube_url"},
+            details={
+                "taskType": "subtitle",
+                "subtitleEngine": "whisper",
+                "subtitleSource": "youtube_url",
+                "subtitleFormat": options.subtitle_format,
+                "whisperDevice": options.device,
+            },
         )
 
 
@@ -328,7 +347,13 @@ def run_uploaded_whisper_job(
             job_id,
             result,
             message="Whisper subtitle extraction completed.",
-            details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "upload"},
+            details={
+                "taskType": "subtitle",
+                "subtitleEngine": "whisper",
+                "subtitleSource": "upload",
+                "subtitleFormat": options.subtitle_format,
+                "whisperDevice": options.device,
+            },
         )
 
 
@@ -363,6 +388,8 @@ def resume_pending_jobs() -> None:
                 LocalWhisperSubtitleOptions(
                     model=str(details.get("whisperModel") or "base"),
                     language=str(details.get("subtitleLanguage") or "ko"),
+                    subtitle_format=str(details.get("subtitleFormat") or "timestamped"),
+                    device=str(details.get("whisperDevice") or "auto"),
                     vad_filter=bool(details.get("vadFilter", True)),
                     start_time=str(details.get("startTime")) if details.get("startTime") is not None else None,
                     end_time=str(details.get("endTime")) if details.get("endTime") is not None else None,
@@ -378,6 +405,8 @@ def resume_pending_jobs() -> None:
                 url=str(details.get("url") or ""),
                 model=str(details.get("whisperModel") or "base"),
                 language=str(details.get("subtitleLanguage") or "ko"),
+                subtitle_format=str(details.get("subtitleFormat") or "timestamped"),
+                device=str(details.get("whisperDevice") or "auto"),
                 vad_filter=bool(details.get("vadFilter", True)),
                 start_time=str(details.get("startTime")) if details.get("startTime") is not None else None,
                 end_time=str(details.get("endTime")) if details.get("endTime") is not None else None,
@@ -402,7 +431,9 @@ def healthcheck() -> dict[str, object]:
         "taskTypes": ["audio", "song_mp3", "video", "subtitle", "batch"],
         "batchModes": ["audio", "song_mp3", "video", "subtitle"],
         "subtitleEngines": list(SUPPORTED_SUBTITLE_ENGINES),
+        "subtitleFormats": list(SUPPORTED_SUBTITLE_FORMATS),
         "whisperModels": list(SUPPORTED_WHISPER_MODELS),
+        "whisperDevices": list(SUPPORTED_WHISPER_DEVICES),
         "subtitleSources": ["youtube_url", "audio_file"],
         "recommendedWhisperModels": {
             "default": "base",
@@ -418,6 +449,9 @@ def create_job(payload: JobRequest) -> dict[str, object]:
     details = {"taskType": payload.task_type}
     if payload.task_type == "subtitle":
         details["subtitleEngine"] = payload.subtitle_engine
+        details["subtitleFormat"] = payload.subtitle_format
+        if payload.subtitle_engine == "whisper":
+            details["whisperDevice"] = payload.whisper_device
     if payload.task_type == "batch":
         details.update({"batchMode": payload.batch_mode, "total": 0, "completed": 0, "failed": 0})
 
@@ -435,7 +469,9 @@ def create_job(payload: JobRequest) -> dict[str, object]:
             build_whisper_resume_details(
                 work_dir=work_dir,
                 model=payload.whisper_model,
+                whisper_device=payload.whisper_device,
                 language=payload.subtitle_language,
+                subtitle_format=payload.subtitle_format,
                 vad_filter=payload.vad_filter,
                 start_time=payload.start_time,
                 end_time=payload.end_time,
@@ -450,6 +486,8 @@ def create_job(payload: JobRequest) -> dict[str, object]:
                 url=payload.url,
                 model=payload.whisper_model,
                 language=payload.subtitle_language,
+                subtitle_format=payload.subtitle_format,
+                device=payload.whisper_device,
                 vad_filter=payload.vad_filter,
                 start_time=payload.start_time,
                 end_time=payload.end_time,
@@ -466,7 +504,9 @@ def create_job(payload: JobRequest) -> dict[str, object]:
 async def create_uploaded_whisper_job(
     file: UploadFile = File(...),
     whisper_model: str = Form("base", alias="whisperModel"),
+    whisper_device: str = Form("auto", alias="whisperDevice"),
     subtitle_language: str = Form("ko", alias="subtitleLanguage"),
+    subtitle_format: str = Form("timestamped", alias="subtitleFormat"),
     vad_filter: bool = Form(True, alias="vadFilter"),
     start_time: str | None = Form(None, alias="startTime"),
     end_time: str | None = Form(None, alias="endTime"),
@@ -480,10 +520,13 @@ async def create_uploaded_whisper_job(
         options = LocalWhisperSubtitleOptions(
             model=whisper_model,
             language=subtitle_language,
+            subtitle_format=subtitle_format,
+            device=whisper_device,
             vad_filter=vad_filter,
             start_time=start_time,
             end_time=end_time,
         )
+        normalize_local_whisper_options(options)
     except ExtractionInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -515,7 +558,9 @@ async def create_uploaded_whisper_job(
         build_whisper_resume_details(
             work_dir=work_dir,
             model=options.model,
+            whisper_device=options.device,
             language=options.language,
+            subtitle_format=options.subtitle_format,
             vad_filter=options.vad_filter,
             start_time=options.start_time,
             end_time=options.end_time,
@@ -580,6 +625,8 @@ def extract_subtitles_endpoint(payload: SubtitleRequest) -> FileResponse:
                     url=payload.url,
                     model=payload.whisper_model,
                     language=payload.subtitle_language,
+                    subtitle_format=payload.subtitle_format,
+                    device=payload.whisper_device,
                     vad_filter=payload.vad_filter,
                     start_time=payload.start_time,
                     end_time=payload.end_time,
@@ -590,6 +637,7 @@ def extract_subtitles_endpoint(payload: SubtitleRequest) -> FileResponse:
                 SubtitleOptions(
                     url=payload.url,
                     subtitle_language=payload.subtitle_language,
+                    subtitle_format=payload.subtitle_format,
                     start_time=payload.start_time,
                     end_time=payload.end_time,
                 )

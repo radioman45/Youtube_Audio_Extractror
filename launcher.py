@@ -38,6 +38,7 @@ from app.services.extractor import (
     extract_song_mp3,
 )
 from app.services.subtitle_extractor import SubtitleOptions, extract_subtitles
+from app.services.task_control import PauseController
 from app.services.video_extractor import VideoExtractionOptions, extract_video
 from app.services.whisper_subtitle_extractor import (
     SUPPORTED_WHISPER_MODELS,
@@ -64,6 +65,15 @@ BATCH_OPTIONS: tuple[tuple[str, str], ...] = (
 SUBTITLE_ENGINE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("youtube", "YouTube 자막"),
     ("whisper", "Whisper 로컬 생성"),
+)
+SUBTITLE_FORMAT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("timestamped", "타임스탬프 포함 (.srt)"),
+    ("clean", "텍스트만 (.txt)"),
+)
+WHISPER_DEVICE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("auto", "Auto (GPU first, else CPU)"),
+    ("cpu", "CPU only"),
+    ("cuda", "NVIDIA GPU (CUDA)"),
 )
 SUBTITLE_SOURCE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("youtube_url", "YouTube 링크"),
@@ -143,7 +153,9 @@ class TaskConfig:
     subtitle_engine: str
     subtitle_source: str
     subtitle_language: str
+    subtitle_format: str
     whisper_model: str
+    whisper_device: str
     vad_filter: bool
     batch_mode: str
     audio_file_path: str | None
@@ -202,11 +214,17 @@ def compute_visibility(
         "subtitle_engine": subtitle_mode or batch_subtitle_mode,
         "subtitle_source": whisper_mode,
         "subtitle_language": subtitle_mode or batch_subtitle_mode,
+        "subtitle_format": subtitle_mode or batch_subtitle_mode,
         "whisper_model": whisper_mode,
+        "whisper_device": whisper_mode,
         "vad_filter": whisper_mode,
         "audio_file": upload_mode,
         "batch_mode": is_batch,
     }
+
+
+def supports_pause_resume(task_type: str, subtitle_engine: str) -> bool:
+    return task_type == "subtitle" and subtitle_engine == "whisper"
 
 
 def build_stylesheet(theme_mode: str) -> str:
@@ -373,6 +391,7 @@ def execute_task(
     config: TaskConfig,
     progress_callback,
     batch_status_callback,
+    pause_controller: PauseController | None = None,
 ) -> tuple[Path, str]:
     task_type = config.task_type
     progress_callback(2, "작업을 준비하는 중입니다.")
@@ -418,11 +437,14 @@ def execute_task(
                 LocalWhisperSubtitleOptions(
                     model=config.whisper_model,
                     language=config.subtitle_language,
+                    subtitle_format=config.subtitle_format,
+                    device=config.whisper_device,
                     vad_filter=config.vad_filter,
                     start_time=config.start_time,
                     end_time=config.end_time,
                 ),
                 progress_callback=progress_callback,
+                pause_controller=pause_controller,
             )
         elif config.subtitle_engine == "whisper":
             result = extract_whisper_subtitles(
@@ -430,11 +452,14 @@ def execute_task(
                     url=config.url or "",
                     model=config.whisper_model,
                     language=config.subtitle_language,
+                    subtitle_format=config.subtitle_format,
+                    device=config.whisper_device,
                     vad_filter=config.vad_filter,
                     start_time=config.start_time,
                     end_time=config.end_time,
                 ),
                 progress_callback=progress_callback,
+                pause_controller=pause_controller,
             )
         else:
             progress_callback(8, "YouTube 자막을 다운로드하는 중입니다.")
@@ -442,6 +467,7 @@ def execute_task(
                 SubtitleOptions(
                     url=config.url or "",
                     subtitle_language=config.subtitle_language,
+                    subtitle_format=config.subtitle_format,
                     start_time=config.start_time,
                     end_time=config.end_time,
                 )
@@ -449,15 +475,16 @@ def execute_task(
             progress_callback(100, "자막 추출이 완료되었습니다.")
     elif task_type == "batch":
         result = extract_batch(
-            BatchExtractionOptions(
-                url=config.url or "",
-                batch_mode=config.batch_mode,
-                audio_format=config.audio_format,
-                video_quality=config.video_quality,
-                subtitle_language=config.subtitle_language,
-                start_time=config.start_time,
-                end_time=config.end_time,
-            ),
+                BatchExtractionOptions(
+                    url=config.url or "",
+                    batch_mode=config.batch_mode,
+                    audio_format=config.audio_format,
+                    video_quality=config.video_quality,
+                    subtitle_language=config.subtitle_language,
+                    subtitle_format=config.subtitle_format,
+                    start_time=config.start_time,
+                    end_time=config.end_time,
+                ),
             progress_callback=progress_callback,
             status_callback=batch_status_callback,
         )
@@ -495,6 +522,7 @@ class ExtractionWorker(QThread):
     def __init__(self, config: TaskConfig):
         super().__init__()
         self._config = config
+        self._pause_controller = PauseController() if supports_pause_resume(config.task_type, config.subtitle_engine) else None
 
     def run(self) -> None:
         try:
@@ -502,12 +530,29 @@ class ExtractionWorker(QThread):
                 self._config,
                 self.progress.emit,
                 self.batch_status.emit,
+                self._pause_controller,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
 
         self.completed.emit(str(saved_path), message)
+
+    def supports_pause_resume(self) -> bool:
+        return self._pause_controller is not None
+
+    def is_paused(self) -> bool:
+        return self._pause_controller is not None and self._pause_controller.is_paused()
+
+    def pause_work(self) -> None:
+        if self._pause_controller is None:
+            return
+        self._pause_controller.pause()
+
+    def resume_work(self) -> None:
+        if self._pause_controller is None:
+            return
+        self._pause_controller.resume()
 
 
 class MainWindow(QMainWindow):
@@ -618,9 +663,17 @@ class MainWindow(QMainWindow):
         self.subtitle_language_row = Row("자막 언어", self.subtitle_language_input)
         panel_layout.addWidget(self.subtitle_language_row)
 
+        self.subtitle_format_combo = self._combo(SUBTITLE_FORMAT_OPTIONS)
+        self.subtitle_format_row = Row("자막 형식", self.subtitle_format_combo)
+        panel_layout.addWidget(self.subtitle_format_row)
+
         self.whisper_model_combo = self._combo(tuple((value, value) for value in SUPPORTED_WHISPER_MODELS))
         self.whisper_model_row = Row("Whisper 모델", self.whisper_model_combo)
         panel_layout.addWidget(self.whisper_model_row)
+
+        self.whisper_device_combo = self._combo(WHISPER_DEVICE_OPTIONS)
+        self.whisper_device_row = Row("Whisper device", self.whisper_device_combo)
+        panel_layout.addWidget(self.whisper_device_row)
 
         self.vad_checkbox = QCheckBox("무음 구간 자동 필터링 사용")
         self.vad_checkbox.setChecked(True)
@@ -649,11 +702,17 @@ class MainWindow(QMainWindow):
 
         self.start_button = QPushButton("작업 시작")
         self.start_button.setObjectName("primaryButton")
+        self.pause_button = QPushButton("일시정지")
+        self.resume_button = QPushButton("재개")
         self.open_result_button = QPushButton("결과 파일 열기")
         self.open_output_button = QPushButton("저장 폴더 열기")
+        self.pause_button.setEnabled(False)
+        self.resume_button.setEnabled(False)
         self.open_result_button.setEnabled(False)
         self.open_output_button.setEnabled(True)
         action_layout.addWidget(self.start_button)
+        action_layout.addWidget(self.pause_button)
+        action_layout.addWidget(self.resume_button)
         action_layout.addWidget(self.open_result_button)
         action_layout.addWidget(self.open_output_button)
         action_layout.addStretch(1)
@@ -692,6 +751,8 @@ class MainWindow(QMainWindow):
         self.audio_file_button.clicked.connect(self.pick_audio_file)
         self.output_dir_button.clicked.connect(self.pick_output_dir)
         self.start_button.clicked.connect(self.start_task)
+        self.pause_button.clicked.connect(self.pause_task)
+        self.resume_button.clicked.connect(self.resume_task)
         self.open_result_button.clicked.connect(self.open_last_result)
         self.open_output_button.clicked.connect(self.open_output_dir)
 
@@ -723,7 +784,9 @@ class MainWindow(QMainWindow):
         self.subtitle_engine_row.setVisible(visibility["subtitle_engine"])
         self.subtitle_source_row.setVisible(visibility["subtitle_source"])
         self.subtitle_language_row.setVisible(visibility["subtitle_language"])
+        self.subtitle_format_row.setVisible(visibility["subtitle_format"])
         self.whisper_model_row.setVisible(visibility["whisper_model"])
+        self.whisper_device_row.setVisible(visibility["whisper_device"])
         self.vad_row.setVisible(visibility["vad_filter"])
         self.batch_mode_row.setVisible(visibility["batch_mode"])
         self.audio_file_row.setVisible(visibility["audio_file"])
@@ -734,6 +797,11 @@ class MainWindow(QMainWindow):
             index = self.subtitle_engine_combo.findData("youtube")
             if index >= 0:
                 self.subtitle_engine_combo.setCurrentIndex(index)
+
+        pause_visible = supports_pause_resume(task_type, subtitle_engine)
+        self.pause_button.setVisible(pause_visible)
+        self.resume_button.setVisible(pause_visible)
+        self.update_pause_buttons()
 
     def current_task_type(self) -> str:
         return str(self.task_type_combo.currentData())
@@ -766,6 +834,27 @@ class MainWindow(QMainWindow):
         if path:
             self.output_dir_input.setText(path)
 
+    def update_pause_buttons(self) -> None:
+        worker_running = self.worker is not None and self.worker.isRunning()
+        pause_supported = worker_running and self.worker.supports_pause_resume()
+        paused = pause_supported and self.worker.is_paused()
+        self.pause_button.setEnabled(pause_supported and not paused)
+        self.resume_button.setEnabled(pause_supported and paused)
+
+    def pause_task(self) -> None:
+        if self.worker is None or not self.worker.isRunning() or not self.worker.supports_pause_resume():
+            return
+        self.worker.pause_work()
+        self.status_label.setText("Whisper 자막 추출 일시정지를 요청했습니다. 현재 처리 중인 구간이 끝나면 멈춥니다.")
+        self.update_pause_buttons()
+
+    def resume_task(self) -> None:
+        if self.worker is None or not self.worker.isRunning() or not self.worker.supports_pause_resume():
+            return
+        self.worker.resume_work()
+        self.status_label.setText("Whisper 자막 추출을 다시 시작합니다.")
+        self.update_pause_buttons()
+
     def set_busy(self, busy: bool) -> None:
         controls = (
             self.task_type_combo,
@@ -777,7 +866,9 @@ class MainWindow(QMainWindow):
             self.subtitle_engine_combo,
             self.subtitle_source_combo,
             self.subtitle_language_input,
+            self.subtitle_format_combo,
             self.whisper_model_combo,
+            self.whisper_device_combo,
             self.vad_checkbox,
             self.batch_mode_combo,
             self.audio_file_button,
@@ -786,6 +877,7 @@ class MainWindow(QMainWindow):
         )
         for widget in controls:
             widget.setEnabled(not busy)
+        self.update_pause_buttons()
 
     def collect_config(self) -> TaskConfig:
         task_type = self.current_task_type()
@@ -813,7 +905,9 @@ class MainWindow(QMainWindow):
             subtitle_engine=subtitle_engine,
             subtitle_source=subtitle_source,
             subtitle_language=subtitle_language,
+            subtitle_format=str(self.subtitle_format_combo.currentData()),
             whisper_model=str(self.whisper_model_combo.currentData()),
+            whisper_device=str(self.whisper_device_combo.currentData()),
             vad_filter=self.vad_checkbox.isChecked(),
             batch_mode=batch_mode,
             audio_file_path=audio_file_path,
@@ -845,14 +939,17 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.handle_failed)
         self.worker.finished.connect(self.cleanup_worker)
         self.worker.start()
+        self.update_pause_buttons()
 
     def cleanup_worker(self) -> None:
         self.set_busy(False)
+        self.update_pause_buttons()
         self.worker = None
 
     def handle_progress(self, value: int, message: str) -> None:
         self.progress_bar.setValue(max(0, min(100, value)))
         self.status_label.setText(message)
+        self.update_pause_buttons()
 
     def handle_batch_status(self, total: int, completed: int, failed: int) -> None:
         self.batch_label.setText(f"배치 진행: 총 {total}개, 성공 {completed}개, 실패 {failed}개")
@@ -867,6 +964,7 @@ class MainWindow(QMainWindow):
 
     def handle_failed(self, message: str) -> None:
         self.status_label.setText(message)
+        self.update_pause_buttons()
         QMessageBox.critical(self, APP_TITLE, message)
 
     def open_last_result(self) -> None:

@@ -24,6 +24,8 @@ from app.services.extractor import (
 
 
 SubtitleLanguage = str
+SubtitleFormat = str
+SUPPORTED_SUBTITLE_FORMATS: tuple[SubtitleFormat, ...] = ("timestamped", "clean")
 TIMING_LINE_PATTERN = re.compile(
     r"^(?P<start>(\d{2}:)?\d{2}:\d{2}\.\d{3})\s+-->\s+(?P<end>(\d{2}:)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$"
 )
@@ -40,6 +42,7 @@ class SubtitleCue:
 class SubtitleOptions:
     url: str
     subtitle_language: SubtitleLanguage
+    subtitle_format: SubtitleFormat = "timestamped"
     start_time: str | None = None
     end_time: str | None = None
 
@@ -48,6 +51,13 @@ def normalize_language_code(language: str) -> str:
     normalized = language.strip().lower()
     if not normalized:
         raise ExtractionInputError("자막 언어 코드를 입력해 주세요.")
+    return normalized
+
+
+def normalize_subtitle_format(subtitle_format: str) -> str:
+    normalized = subtitle_format.strip().lower()
+    if normalized not in SUPPORTED_SUBTITLE_FORMATS:
+        raise ExtractionInputError("Unsupported subtitle format.")
     return normalized
 
 
@@ -215,6 +225,26 @@ def render_srt(cues: list[SubtitleCue]) -> str:
     return "\n\n".join(blocks).strip() + "\n"
 
 
+def render_clean_text_entries(entries: list[str]) -> str:
+    cleaned_entries: list[str] = []
+    for entry in entries:
+        cleaned = re.sub(r"\s+", " ", entry).strip()
+        if not cleaned:
+            continue
+        if cleaned_entries and cleaned_entries[-1] == cleaned:
+            continue
+        cleaned_entries.append(cleaned)
+
+    if not cleaned_entries:
+        raise ExtractionRuntimeError("?좏슚???먮쭑 ?띿뒪?몃? 李얠? 紐삵뻽?듬땲??")
+
+    return "\n".join(cleaned_entries).strip() + "\n"
+
+
+def render_clean_subtitle_text(cues: list[SubtitleCue]) -> str:
+    return render_clean_text_entries([" ".join(cue.lines) for cue in cues])
+
+
 def filter_webvtt(content: str, start_seconds: float | None, end_seconds: float | None) -> str:
     cues = filter_cues(parse_vtt_cues(content), start_seconds, end_seconds)
     blocks = ["WEBVTT"]
@@ -235,16 +265,30 @@ def build_subtitle_download_name(
     subtitle_language: SubtitleLanguage,
     start_seconds: int | None,
     end_seconds: int | None,
+    subtitle_format: SubtitleFormat = "timestamped",
 ) -> str:
+    normalized_format = normalize_subtitle_format(subtitle_format)
     safe_title = sanitize_filename(title)
-    base_name = build_download_name(safe_title, "srt", start_seconds, end_seconds).rsplit(".", 1)[0]
-    return f"{base_name}_{normalize_language_code(subtitle_language)}.srt"
+    file_extension = "srt" if normalized_format == "timestamped" else "txt"
+    base_name = build_download_name(safe_title, file_extension, start_seconds, end_seconds).rsplit(".", 1)[0]
+    language_suffix = normalize_language_code(subtitle_language)
+    if normalized_format == "clean":
+        return f"{base_name}_{language_suffix}_clean.txt"
+    return f"{base_name}_{language_suffix}.srt"
+
+
+def resolve_subtitle_media_type(subtitle_format: SubtitleFormat) -> str:
+    normalized_format = normalize_subtitle_format(subtitle_format)
+    if normalized_format == "clean":
+        return "text/plain; charset=utf-8"
+    return "application/x-subrip; charset=utf-8"
 
 
 def extract_subtitles(options: SubtitleOptions) -> ExtractionResult:
     normalized_url = validate_youtube_url(options.url)
     start_seconds = parse_time_to_seconds(options.start_time)
     end_seconds = parse_time_to_seconds(options.end_time)
+    subtitle_format = normalize_subtitle_format(options.subtitle_format)
     temp_dir = Path(tempfile.mkdtemp(prefix="youtube-subtitles-"))
 
     try:
@@ -269,7 +313,11 @@ def extract_subtitles(options: SubtitleOptions) -> ExtractionResult:
         subtitle_content = downloaded_path.read_text(encoding="utf-8-sig")
         cues = parse_vtt_cues(subtitle_content)
         filtered_cues = filter_cues(cues, start_seconds, end_seconds)
-        srt_content = render_srt(filtered_cues)
+        rendered_subtitles = (
+            render_srt(filtered_cues)
+            if subtitle_format == "timestamped"
+            else render_clean_subtitle_text(filtered_cues)
+        )
 
         title = str(downloaded_info.get("title") or metadata.get("title") or "youtube-subtitles")
         output_name = build_subtitle_download_name(
@@ -277,15 +325,16 @@ def extract_subtitles(options: SubtitleOptions) -> ExtractionResult:
             options.subtitle_language,
             start_seconds,
             end_seconds,
+            subtitle_format=subtitle_format,
         )
         output_path = temp_dir / output_name
-        output_path.write_text(srt_content, encoding="utf-8")
+        output_path.write_text(rendered_subtitles, encoding="utf-8")
 
         return ExtractionResult(
             file_path=output_path,
             download_name=output_name,
             temp_dir=temp_dir,
-            media_type="application/x-subrip; charset=utf-8",
+            media_type=resolve_subtitle_media_type(subtitle_format),
         )
     except (DownloadError, OSError) as exc:
         cleanup_temp_dir(temp_dir)

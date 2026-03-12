@@ -14,10 +14,14 @@ const subtitleSourceField = document.querySelector("#subtitle-source-field");
 const subtitleSourceSelect = document.querySelector("#subtitleSource");
 const subtitleLanguageField = document.querySelector("#subtitle-language-field");
 const subtitleLanguageSelect = document.querySelector("#subtitleLanguage");
+const subtitleFormatField = document.querySelector("#subtitle-format-field");
+const subtitleFormatSelect = document.querySelector("#subtitleFormat");
 const subtitleLanguageCustomField = document.querySelector("#subtitle-language-custom-field");
 const subtitleLanguageCustomInput = document.querySelector("#subtitleLanguageCustom");
 const whisperModelField = document.querySelector("#whisper-model-field");
 const whisperModelSelect = document.querySelector("#whisperModel");
+const whisperDeviceField = document.querySelector("#whisper-device-field");
+const whisperDeviceSelect = document.querySelector("#whisperDevice");
 const audioUploadField = document.querySelector("#audio-upload-field");
 const audioFileInput = document.querySelector("#audioFile");
 const audioUploadHelp = document.querySelector("#audio-upload-help");
@@ -231,6 +235,14 @@ function getEffectiveSubtitleLanguage() {
   return subtitleLanguageSelect.value;
 }
 
+function getEffectiveSubtitleFormat() {
+  return subtitleFormatSelect.value || "timestamped";
+}
+
+function getEffectiveWhisperDevice() {
+  return whisperDeviceSelect.value || "auto";
+}
+
 function isWhisperSubtitleMode() {
   return currentMode === "subtitle" && subtitleEngineSelect.value === "whisper";
 }
@@ -249,6 +261,7 @@ function syncSubtitleUi() {
   const isBatchSubtitle = currentMode === "batch" && batchModeSelect.value === "subtitle";
   const showEngine = currentMode === "subtitle";
   const showLanguage = currentMode === "subtitle" || isBatchSubtitle;
+  const showFormat = currentMode === "subtitle" || isBatchSubtitle;
   const showWhisperOptions = isWhisperSubtitleMode();
   const showUploadSource = showWhisperOptions;
   const showUploadField = isUploadWhisperMode();
@@ -256,7 +269,9 @@ function syncSubtitleUi() {
   subtitleEngineField.classList.toggle("hidden", !showEngine);
   subtitleSourceField.classList.toggle("hidden", !showUploadSource);
   subtitleLanguageField.classList.toggle("hidden", !showLanguage);
+  subtitleFormatField.classList.toggle("hidden", !showFormat);
   whisperModelField.classList.toggle("hidden", !showWhisperOptions);
+  whisperDeviceField.classList.toggle("hidden", !showWhisperOptions);
   audioUploadField.classList.toggle("hidden", !showUploadField);
   audioUploadHelp.classList.toggle("hidden", !showUploadField);
   vadFilterField.classList.toggle("hidden", !showWhisperOptions);
@@ -410,7 +425,9 @@ function buildUploadPayload() {
 
   formData.append("file", audioFile);
   formData.append("whisperModel", whisperModelSelect.value);
+  formData.append("whisperDevice", getEffectiveWhisperDevice());
   formData.append("subtitleLanguage", getEffectiveSubtitleLanguage() || "ko");
+  formData.append("subtitleFormat", getEffectiveSubtitleFormat());
   formData.append("vadFilter", String(Boolean(vadFilterCheckbox.checked)));
 
   const startTime = String(startTimeInput.value || "").trim();
@@ -425,7 +442,7 @@ function buildUploadPayload() {
   return {
     uploadMode: true,
     endpoint: "/api/subtitles/upload/jobs",
-    fallbackName: "uploaded-whisper-subtitles.srt",
+    fallbackName: getEffectiveSubtitleFormat() === "clean" ? "uploaded-whisper-subtitles.txt" : "uploaded-whisper-subtitles.srt",
     body: formData,
   };
 }
@@ -473,15 +490,25 @@ function buildJsonPayload() {
 
   if (currentMode === "subtitle") {
     const subtitleEngine = subtitleEngineSelect.value;
+    const subtitleFormat = getEffectiveSubtitleFormat();
     return {
       uploadMode: false,
       endpoint: "/api/jobs",
-      fallbackName: subtitleEngine === "whisper" ? "youtube-whisper-subtitles.srt" : "youtube-subtitles.srt",
+      fallbackName:
+        subtitleFormat === "clean"
+          ? subtitleEngine === "whisper"
+            ? "youtube-whisper-subtitles.txt"
+            : "youtube-subtitles.txt"
+          : subtitleEngine === "whisper"
+            ? "youtube-whisper-subtitles.srt"
+            : "youtube-subtitles.srt",
       body: JSON.stringify({
         ...commonPayload,
         subtitleEngine,
+        subtitleFormat,
         subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
         whisperModel: whisperModelSelect.value,
+        whisperDevice: getEffectiveWhisperDevice(),
         vadFilter: Boolean(vadFilterCheckbox.checked),
       }),
     };
@@ -498,9 +525,11 @@ function buildJsonPayload() {
       batchMode,
       audioFormat: audioFormatSelect.value,
       videoQuality: videoQualitySelect.value,
+      subtitleFormat: getEffectiveSubtitleFormat(),
       subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
       subtitleEngine: "youtube",
       whisperModel: whisperModelSelect.value,
+      whisperDevice: getEffectiveWhisperDevice(),
       vadFilter: Boolean(vadFilterCheckbox.checked),
     }),
   };

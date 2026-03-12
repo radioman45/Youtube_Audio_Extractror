@@ -434,3 +434,132 @@ Whisper처럼 오래 걸리는 작업은 즉시 응답보다 “작업 생성 ->
 - 외부 모델 의존 기능은 코드보다 네트워크 정책이 먼저 깨질 수 있다.
 - 에러 메시지는 사용자 행동을 바꿀 수 있을 정도로 구체적이어야 한다.
 - 문서에는 기능 설명뿐 아니라 “어떤 산출물을 실행해야 하는지”까지 적어 두는 편이 낫다.
+
+---
+
+## 15. 오늘 작업 추가 메모 (2026-03-13)
+
+### 15.1 자막 형식 선택 추가
+
+- 이제 자막 추출 시 2가지 형식을 선택할 수 있다.
+  - `timestamped`: 타임스탬프가 포함된 `.srt`
+  - `clean`: 시간 정보 없이 텍스트만 있는 `.txt`
+- 초보자 기준 사용법:
+  - 영상 편집이나 자막 플레이어용이면 `timestamped`
+  - 요약, 복사/붙여넣기, 문서 정리용이면 `clean`
+
+관련 파일:
+
+- `app/services/subtitle_extractor.py`
+- `app/services/whisper_subtitle_extractor.py`
+- `app/main.py`
+- `launcher.py`
+- `app/static/index.html`
+- `app/static/app.js`
+
+### 15.2 Whisper 자막 추출 일시정지 / 재개
+
+- Whisper 자막 추출 작업에 `일시정지` / `재개` 버튼을 추가했다.
+- 동작 방식은 “강제 중단”이 아니라 “안전한 체크 지점에서 잠시 멈춤”이다.
+- 즉, 버튼을 눌렀다고 0.1초 만에 딱 멈추는 것은 아니고:
+  - 현재 처리 중인 세그먼트
+  - 현재 내려받는 파일 조각
+  - 현재 전사 중인 청크
+  가 끝나는 시점에 멈춘다.
+
+초보자 포인트:
+
+- 이런 방식이 필요한 이유는 Whisper나 다운로드 작업은 중간에 억지로 끊으면 상태가 꼬일 수 있기 때문이다.
+- 그래서 “바로 멈춤”보다 “안전하게 멈춤”이 더 중요하다.
+
+핵심 파일:
+
+- `app/services/task_control.py`
+- `app/services/whisper_subtitle_extractor.py`
+- `launcher.py`
+
+### 15.3 Whisper 실행 장치 선택 추가
+
+- 이제 Whisper 실행 장치를 직접 선택할 수 있다.
+- 선택지는 3개다.
+  - `Auto (GPU first, else CPU)`
+  - `CPU only`
+  - `NVIDIA GPU (CUDA)`
+
+### 15.4 Auto 모드가 실제로 하는 일
+
+`Auto`는 내부에서 아래 순서로 판단한다.
+
+1. NVIDIA GPU(CUDA)를 사용할 수 있는지 확인
+2. 가능하면 GPU로 Whisper 실행
+3. GPU가 없으면 CPU로 실행
+4. GPU가 있다고 판단했더라도 실제 실행 중 CUDA 라이브러리 문제가 나면 CPU로 자동 fallback
+
+즉:
+
+- 집 노트북처럼 NVIDIA GPU가 있는 PC는 보통 GPU 사용
+- 회사 PC처럼 GPU가 없거나 제한된 PC는 CPU 사용
+
+### 15.5 초보자에게 권장하는 선택
+
+- 집 노트북(RTX 3050 등 NVIDIA GPU 있음): `Auto`
+- 회사 PC(GPU 없음 또는 보안 정책으로 CUDA 사용 어려움): `Auto` 또는 `CPU only`
+- `NVIDIA GPU (CUDA)`:
+  - GPU 사용을 강제로 시도하는 옵션
+  - CUDA 런타임/드라이버가 안 맞으면 실패할 수 있다.
+
+실무적으로는 대부분 `Auto`가 가장 편하다.
+
+### 15.6 왜 이번 수정이 중요한가
+
+이전에는 Whisper가 사실상 CPU 경로로만 동작해서, GPU가 있어도 속도가 충분히 나오지 않을 수 있었다.
+
+이번 수정으로:
+
+- 고사양 PC에서는 GPU를 활용할 수 있고
+- GPU가 없는 PC에서는 CPU로 안전하게 내려가며
+- 같은 exe를 집/회사 PC에서 모두 사용할 수 있게 됐다.
+
+### 15.7 파일을 따라가며 이해하는 순서
+
+아래 순서대로 보면 구조를 이해하기 쉽다.
+
+1. `launcher.py`
+   - 데스크톱 화면에 `Whisper device` 선택 UI가 어디에 붙었는지 본다.
+2. `app/models.py`
+   - `whisper_device` 필드가 요청 모델에 어떻게 추가됐는지 본다.
+3. `app/main.py`
+   - API 요청값이 실제 Whisper 옵션으로 어떻게 전달되는지 본다.
+4. `app/services/whisper_subtitle_extractor.py`
+   - `auto -> cuda/cpu 선택 -> fallback`이 실제로 어떻게 동작하는지 본다.
+
+### 15.8 오늘 수정 후 확인할 것
+
+exe 실행 후 `자막 추출 -> Whisper`에서 아래를 확인하면 된다.
+
+- `자막 형식`
+  - `타임스탬프 포함 (.srt)`
+  - `텍스트만 (.txt)`
+- `Whisper 모델`
+- `Whisper device`
+  - `Auto (GPU first, else CPU)`
+  - `CPU only`
+  - `NVIDIA GPU (CUDA)`
+- 작업 중
+  - `일시정지`
+  - `재개`
+
+### 15.9 테스트 결과
+
+오늘 수정 후 전체 테스트 결과:
+
+- `66 passed`
+
+이 의미는:
+
+- Whisper 관련 기능
+- API 연결
+- 데스크톱 런처 연결
+- 기존 자막 기능
+
+이 다시 한 번 자동 확인되었다는 뜻이다.

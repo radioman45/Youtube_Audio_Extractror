@@ -8,9 +8,10 @@ from app.services.extractor import (
     SUPPORTED_VIDEO_QUALITIES,
     is_supported_youtube_url,
 )
-from app.services.subtitle_extractor import normalize_language_code
+from app.services.subtitle_extractor import normalize_language_code, normalize_subtitle_format
 from app.services.whisper_subtitle_extractor import (
     normalize_subtitle_engine,
+    normalize_whisper_device,
     normalize_whisper_model,
 )
 from app.services.time_utils import parse_timestamp, validate_time_range
@@ -19,6 +20,8 @@ from app.services.time_utils import parse_timestamp, validate_time_range
 TaskType = Literal["audio", "song_mp3", "video", "subtitle", "batch"]
 BatchMode = Literal["audio", "song_mp3", "video", "subtitle"]
 SubtitleEngine = Literal["youtube", "whisper"]
+SubtitleFormat = Literal["timestamped", "clean"]
+WhisperDevice = Literal["auto", "cpu", "cuda"]
 
 
 class RequestBase(BaseModel):
@@ -65,7 +68,9 @@ class ExtractRequest(RequestBase):
 class SubtitleRequest(RequestBase):
     subtitle_language: str = "ko"
     subtitle_engine: SubtitleEngine = "youtube"
+    subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
+    whisper_device: WhisperDevice = "auto"
     vad_filter: bool = True
 
     @field_validator("subtitle_language")
@@ -78,10 +83,20 @@ class SubtitleRequest(RequestBase):
     def validate_engine(cls, value: str) -> str:
         return normalize_subtitle_engine(value)
 
+    @field_validator("subtitle_format")
+    @classmethod
+    def validate_subtitle_format_name(cls, value: str) -> str:
+        return normalize_subtitle_format(value)
+
     @field_validator("whisper_model")
     @classmethod
     def validate_whisper_model_name(cls, value: str) -> str:
         return normalize_whisper_model(value)
+
+    @field_validator("whisper_device")
+    @classmethod
+    def validate_whisper_device_name(cls, value: str) -> str:
+        return normalize_whisper_device(value)
 
 
 class JobRequest(RequestBase):
@@ -90,7 +105,9 @@ class JobRequest(RequestBase):
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
     subtitle_engine: SubtitleEngine = "youtube"
+    subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
+    whisper_device: WhisperDevice = "auto"
     vad_filter: bool = True
     batch_mode: BatchMode | None = None
 
@@ -118,10 +135,20 @@ class JobRequest(RequestBase):
     def validate_subtitle_engine_name(cls, value: str) -> str:
         return normalize_subtitle_engine(value)
 
+    @field_validator("subtitle_format")
+    @classmethod
+    def validate_job_subtitle_format_name(cls, value: str) -> str:
+        return normalize_subtitle_format(value)
+
     @field_validator("whisper_model")
     @classmethod
     def validate_job_whisper_model_name(cls, value: str) -> str:
         return normalize_whisper_model(value)
+
+    @field_validator("whisper_device")
+    @classmethod
+    def validate_job_whisper_device_name(cls, value: str) -> str:
+        return normalize_whisper_device(value)
 
     @model_validator(mode="after")
     def validate_conditional_fields(self) -> Self:

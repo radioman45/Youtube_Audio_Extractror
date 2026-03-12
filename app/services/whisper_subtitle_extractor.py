@@ -29,13 +29,21 @@ from app.services.extractor import (
     validate_time_range,
     validate_youtube_url,
 )
-from app.services.subtitle_extractor import format_srt_timestamp, normalize_language_code
+from app.services.subtitle_extractor import (
+    format_srt_timestamp,
+    normalize_language_code,
+    normalize_subtitle_format,
+    render_clean_text_entries,
+    resolve_subtitle_media_type,
+)
+from app.services.task_control import PauseController
 from app.services.time_utils import seconds_to_ffmpeg_timestamp
 
 
 SubtitleEngine = str
 WhisperModelName = str
 WhisperOutputFormat = str
+WhisperDevice = str
 
 SUPPORTED_SUBTITLE_ENGINES: tuple[SubtitleEngine, ...] = ("youtube", "whisper")
 SUPPORTED_WHISPER_MODELS: tuple[WhisperModelName, ...] = (
@@ -80,7 +88,7 @@ WHISPER_FALLBACK_VOCABULARY_FILENAMES: tuple[str, ...] = ("vocabulary.txt", "voc
 LOCAL_ONLY_ENV_VAR = "APP_WHISPER_LOCAL_ONLY"
 WHISPER_DEVICE_ENV_VAR = "APP_WHISPER_DEVICE"
 WHISPER_HUB_ENDPOINTS_ENV_VAR = "APP_WHISPER_HUB_ENDPOINTS"
-SUPPORTED_WHISPER_DEVICES: tuple[str, ...] = ("cpu", "auto", "cuda")
+SUPPORTED_WHISPER_DEVICES: tuple[str, ...] = ("auto", "cpu", "cuda")
 DEFAULT_WHISPER_HUB_ENDPOINTS: tuple[str, ...] = (
     "https://huggingface.co",
     "https://hf-mirror.com",
@@ -91,6 +99,13 @@ WHISPER_CHUNK_SECONDS = 30 * 60
 WHISPER_CHUNK_FILESIZE_BYTES = 512 * 1024 * 1024
 WHISPER_RESUME_STATE_FILENAME = "whisper-resume-state.json"
 WHISPER_FULL_CUES_FILENAME = "whisper-full-cues.json"
+WHISPER_MODEL_PREP_PROGRESS = 89
+WHISPER_MODEL_SUPPORT_PROGRESS = 90
+WHISPER_MODEL_BINARY_PROGRESS_START = 91
+WHISPER_MODEL_BINARY_PROGRESS_END = 93
+WHISPER_MODEL_READY_PROGRESS = 93
+WHISPER_TRANSCRIBE_PROGRESS_START = 94
+WHISPER_TRANSCRIBE_PROGRESS_END = 99
 
 
 @dataclass(slots=True)
@@ -106,6 +121,8 @@ class WhisperSubtitleOptions:
     model: WhisperModelName
     language: str = "ko"
     output_format: WhisperOutputFormat = "srt"
+    subtitle_format: str = "timestamped"
+    device: WhisperDevice = "auto"
     vad_filter: bool = True
     start_time: str | None = None
     end_time: str | None = None
@@ -116,12 +133,49 @@ class LocalWhisperSubtitleOptions:
     model: WhisperModelName
     language: str = "ko"
     output_format: WhisperOutputFormat = "srt"
+    subtitle_format: str = "timestamped"
+    device: WhisperDevice = "auto"
     vad_filter: bool = True
     start_time: str | None = None
     end_time: str | None = None
 
 
 ResumeStateCallback = Callable[[dict[str, object]], None]
+
+
+@dataclass(slots=True)
+class ManagedWhisperModel:
+    inner: object
+    requested_device: str
+    active_device: str
+    load_local_model: Callable[[str], object]
+
+    def transcribe(self, *args, **kwargs):
+        return self.inner.transcribe(*args, **kwargs)
+
+    def fallback_to_cpu_if_auto(self, progress_callback: ProgressCallback | None = None) -> bool:
+        if self.requested_device != "auto" or self.active_device != "cuda":
+            return False
+        self.inner = self.load_local_model("cpu")
+        self.active_device = "cpu"
+        return True
+
+
+def wait_for_whisper_resume(
+    pause_controller: PauseController | None,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    progress: int | None = None,
+    message: str = "Whisper subtitle extraction is paused. Click resume to continue.",
+) -> None:
+    if pause_controller is None or not pause_controller.is_paused():
+        return
+
+    if progress is not None:
+        notify_progress(progress_callback, progress, message)
+
+    while pause_controller.is_paused():
+        pause_controller.wait_until_resumed(0.2)
 
 
 def normalize_subtitle_engine(engine: str) -> str:
@@ -135,6 +189,13 @@ def normalize_whisper_model(model: str) -> str:
     normalized = model.strip().lower()
     if normalized not in SUPPORTED_WHISPER_MODELS:
         raise ExtractionInputError("Unsupported Whisper model.")
+    return normalized
+
+
+def normalize_whisper_device(device: str) -> str:
+    normalized = device.strip().lower() or "auto"
+    if normalized not in SUPPORTED_WHISPER_DEVICES:
+        raise ExtractionInputError("Unsupported Whisper device.")
     return normalized
 
 
@@ -235,12 +296,17 @@ def build_whisper_download_name(
     model: WhisperModelName,
     language: str,
     output_format: WhisperOutputFormat,
+    subtitle_format: str,
     start_seconds: int | None,
     end_seconds: int | None,
 ) -> str:
-    base_name = build_download_name(title, output_format, start_seconds, end_seconds).rsplit(".", 1)[0]
+    normalized_subtitle_format = normalize_subtitle_format(subtitle_format)
+    file_extension = output_format if normalized_subtitle_format == "timestamped" else "txt"
+    base_name = build_download_name(title, file_extension, start_seconds, end_seconds).rsplit(".", 1)[0]
     safe_model = sanitize_filename(model).replace(" ", "-")
     safe_language = normalize_language_code(language).replace("-", "_")
+    if normalized_subtitle_format == "clean":
+        return f"{base_name}_whisper_{safe_model}_{safe_language}_clean.txt"
     return f"{base_name}_whisper_{safe_model}_{safe_language}.{output_format}"
 
 
@@ -372,11 +438,32 @@ def should_use_local_only_whisper_model() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def resolve_whisper_device() -> str:
-    configured = os.environ.get(WHISPER_DEVICE_ENV_VAR, "cpu").strip().lower()
-    if configured not in SUPPORTED_WHISPER_DEVICES:
-        return "cpu"
+def get_whisper_cuda_device_count() -> int:
+    try:
+        import ctranslate2
+
+        return max(0, int(ctranslate2.get_cuda_device_count()))
+    except Exception:
+        return 0
+
+
+def resolve_whisper_device(preferred_device: str | None = None) -> str:
+    raw_value = preferred_device if preferred_device is not None else os.environ.get(WHISPER_DEVICE_ENV_VAR, "auto")
+    try:
+        configured = normalize_whisper_device(raw_value)
+    except ExtractionInputError:
+        if preferred_device is None:
+            return "cpu"
+        raise
+
+    if configured == "auto":
+        return "cuda" if get_whisper_cuda_device_count() > 0 else "cpu"
     return configured
+
+
+def is_whisper_cuda_runtime_error(exc: Exception) -> bool:
+    normalized_message = str(exc).lower()
+    return "cublas" in normalized_message or "cudnn" in normalized_message or "cuda" in normalized_message
 
 
 def get_whisper_download_endpoints() -> tuple[str, ...]:
@@ -450,6 +537,18 @@ def has_complete_local_whisper_model(model_dir: Path) -> bool:
     return any(model_dir.glob("vocabulary.*"))
 
 
+def format_file_size(byte_count: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(max(0, byte_count))
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
+
+
 def summarize_whisper_download_exception(exc: Exception) -> str:
     parts: list[str] = []
     current: Exception | None = exc
@@ -479,7 +578,10 @@ def download_whisper_repository_file(
     target_path: Path,
     allow_resume: bool = False,
     progress_callback: ProgressCallback | None = None,
-    progress_model_name: str | None = None,
+    progress_label: str | None = None,
+    progress_start: int | None = None,
+    progress_end: int | None = None,
+    pause_controller: PauseController | None = None,
 ) -> bool:
     import httpx
     from huggingface_hub import hf_hub_url
@@ -499,35 +601,79 @@ def download_whisper_repository_file(
 
             total_bytes = int(response.headers.get("Content-Length") or 0)
             written_bytes = existing_bytes
+            total_with_existing = (
+                total_bytes + existing_bytes if response.status_code == 206 and existing_bytes > 0 else total_bytes
+            )
             mode = "ab" if existing_bytes > 0 and response.status_code == 206 else "wb"
             if mode == "wb" and temp_path.exists():
                 temp_path.unlink()
                 written_bytes = 0
 
+            if progress_callback is not None and progress_label is not None and progress_start is not None:
+                if total_with_existing > 0:
+                    if existing_bytes > 0:
+                        notify_progress(
+                            progress_callback,
+                            progress_start,
+                            f"{progress_label} (resuming {format_file_size(existing_bytes)} / {format_file_size(total_with_existing)}).",
+                        )
+                    else:
+                        notify_progress(
+                            progress_callback,
+                            progress_start,
+                            f"{progress_label} (0%, 0 B / {format_file_size(total_with_existing)}).",
+                        )
+                else:
+                    notify_progress(progress_callback, progress_start, progress_label)
+
             last_reported_percent = -1
+            current_progress = progress_start
             with temp_path.open(mode) as handle:
                 for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    wait_for_whisper_resume(
+                        pause_controller,
+                        progress_callback=progress_callback,
+                        progress=current_progress,
+                    )
                     if not chunk:
                         continue
                     handle.write(chunk)
                     written_bytes += len(chunk)
 
-                    if progress_callback is None or progress_model_name is None or total_bytes <= 0:
+                    if (
+                        progress_callback is None
+                        or progress_label is None
+                        or progress_start is None
+                        or progress_end is None
+                        or total_with_existing <= 0
+                    ):
                         continue
 
-                    total_with_existing = total_bytes + existing_bytes if response.status_code == 206 and existing_bytes > 0 else total_bytes
                     percent = int((written_bytes / total_with_existing) * 100)
                     if percent == last_reported_percent:
                         continue
                     last_reported_percent = percent
-                    mapped_progress = 90 + min(3, int((percent / 100) * 3))
+                    mapped_progress = progress_start + int(((progress_end - progress_start) * written_bytes) / total_with_existing)
+                    current_progress = mapped_progress
                     notify_progress(
                         progress_callback,
                         mapped_progress,
-                        f"Downloading Whisper model '{progress_model_name}' ({percent}%).",
+                        f"{progress_label} ({percent}%, {format_file_size(written_bytes)} / {format_file_size(total_with_existing)}).",
                     )
 
     temp_path.replace(target_path)
+    if (
+        progress_callback is not None
+        and progress_label is not None
+        and progress_end is not None
+        and target_path.exists()
+    ):
+        final_size = target_path.stat().st_size
+        notify_progress(
+            progress_callback,
+            progress_end,
+            f"{progress_label} (100%, {format_file_size(final_size)} / {format_file_size(final_size)}).",
+        )
     return True
 
 
@@ -560,42 +706,95 @@ def resolve_whisper_vocabulary_filenames(repo_id: str, endpoint: str) -> tuple[s
     return WHISPER_FALLBACK_VOCABULARY_FILENAMES
 
 
-def download_whisper_support_files(repo_id: str, model_dir: Path, endpoint: str) -> None:
+def download_whisper_support_files(
+    repo_id: str,
+    model_dir: Path,
+    endpoint: str,
+    model: str,
+    progress_callback: ProgressCallback | None = None,
+    pause_controller: PauseController | None = None,
+) -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
+    endpoint_label = describe_whisper_download_endpoint(endpoint)
 
     for filename in WHISPER_REQUIRED_SUPPORT_FILES:
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=WHISPER_MODEL_SUPPORT_PROGRESS,
+        )
         target_path = model_dir / filename
         if target_path.exists():
             continue
+        notify_progress(
+            progress_callback,
+            WHISPER_MODEL_SUPPORT_PROGRESS,
+            f"Downloading Whisper support file '{filename}' for model '{model}' from {endpoint_label}.",
+        )
         downloaded = download_whisper_repository_file(
             repo_id=repo_id,
             filename=filename,
             endpoint=endpoint,
             target_path=target_path,
+            progress_callback=progress_callback,
+            progress_label=f"Downloading Whisper support file '{filename}' for model '{model}'",
+            progress_start=WHISPER_MODEL_SUPPORT_PROGRESS,
+            progress_end=WHISPER_MODEL_SUPPORT_PROGRESS,
+            pause_controller=pause_controller,
         )
         if not downloaded:
             raise ExtractionRuntimeError(f"Required Whisper support file '{filename}' was not found.")
 
     for filename in WHISPER_OPTIONAL_SUPPORT_FILES:
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=WHISPER_MODEL_SUPPORT_PROGRESS,
+        )
         target_path = model_dir / filename
         if target_path.exists():
             continue
+        notify_progress(
+            progress_callback,
+            WHISPER_MODEL_SUPPORT_PROGRESS,
+            f"Checking optional Whisper support file '{filename}' for model '{model}'.",
+        )
         download_whisper_repository_file(
             repo_id=repo_id,
             filename=filename,
             endpoint=endpoint,
             target_path=target_path,
+            progress_callback=progress_callback,
+            progress_label=f"Downloading optional Whisper support file '{filename}' for model '{model}'",
+            progress_start=WHISPER_MODEL_SUPPORT_PROGRESS,
+            progress_end=WHISPER_MODEL_SUPPORT_PROGRESS,
+            pause_controller=pause_controller,
         )
 
     if any(model_dir.glob("vocabulary.*")):
         return
 
+    notify_progress(
+        progress_callback,
+        WHISPER_MODEL_SUPPORT_PROGRESS,
+        f"Resolving Whisper vocabulary files for model '{model}'.",
+    )
     for filename in resolve_whisper_vocabulary_filenames(repo_id, endpoint):
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=WHISPER_MODEL_SUPPORT_PROGRESS,
+        )
         download_whisper_repository_file(
             repo_id=repo_id,
             filename=filename,
             endpoint=endpoint,
             target_path=model_dir / Path(filename).name,
+            progress_callback=progress_callback,
+            progress_label=f"Downloading Whisper vocabulary file '{Path(filename).name}' for model '{model}'",
+            progress_start=WHISPER_MODEL_SUPPORT_PROGRESS,
+            progress_end=WHISPER_MODEL_SUPPORT_PROGRESS,
+            pause_controller=pause_controller,
         )
         if any(model_dir.glob("vocabulary.*")):
             return
@@ -610,6 +809,7 @@ def download_whisper_model_binary(
     endpoint: str,
     target_path: Path,
     progress_callback: ProgressCallback | None = None,
+    pause_controller: PauseController | None = None,
 ) -> None:
     downloaded = download_whisper_repository_file(
         repo_id=repo_id,
@@ -618,7 +818,12 @@ def download_whisper_model_binary(
         target_path=target_path,
         allow_resume=True,
         progress_callback=progress_callback,
-        progress_model_name=model,
+        progress_label=(
+            f"Downloading Whisper model '{model}' weights from {describe_whisper_download_endpoint(endpoint)}"
+        ),
+        progress_start=WHISPER_MODEL_BINARY_PROGRESS_START,
+        progress_end=WHISPER_MODEL_BINARY_PROGRESS_END,
+        pause_controller=pause_controller,
     )
     if not downloaded:
         raise ExtractionRuntimeError("Required Whisper model binary was not found.")
@@ -627,6 +832,7 @@ def download_whisper_model_binary(
 def ensure_local_whisper_model_directory(
     model: str,
     progress_callback: ProgressCallback | None = None,
+    pause_controller: PauseController | None = None,
 ) -> Path:
     resolved_name = resolve_model_name(model)
     repo_id = get_whisper_repository_id(resolved_name)
@@ -637,20 +843,32 @@ def ensure_local_whisper_model_directory(
 
     notify_progress(
         progress_callback,
-        90,
-        f"Preparing Whisper model '{model}' for local use.",
+        WHISPER_MODEL_PREP_PROGRESS,
+        f"Preparing Whisper model '{model}' for local use in {model_dir}.",
     )
     endpoint_errors: list[str] = []
     for index, endpoint in enumerate(get_whisper_download_endpoints()):
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=WHISPER_MODEL_PREP_PROGRESS,
+        )
         if index > 0:
             notify_progress(
                 progress_callback,
-                90,
+                WHISPER_MODEL_PREP_PROGRESS,
                 f"Retrying Whisper model '{model}' with {describe_whisper_download_endpoint(endpoint)}.",
             )
 
         try:
-            download_whisper_support_files(repo_id, model_dir, endpoint)
+            download_whisper_support_files(
+                repo_id,
+                model_dir,
+                endpoint,
+                model,
+                progress_callback=progress_callback,
+                pause_controller=pause_controller,
+            )
             if not (model_dir / "model.bin").exists():
                 download_whisper_model_binary(
                     repo_id=repo_id,
@@ -658,6 +876,7 @@ def ensure_local_whisper_model_directory(
                     endpoint=endpoint,
                     target_path=model_dir / "model.bin",
                     progress_callback=progress_callback,
+                    pause_controller=pause_controller,
                 )
         except Exception as exc:
             endpoint_errors.append(
@@ -686,9 +905,53 @@ def instantiate_whisper_model(whisper_model_class, model_name: str, *, local_fil
         return whisper_model_class(model_name, device=device)
 
 
+def open_local_whisper_model(
+    whisper_model_class,
+    model: WhisperModelName,
+    *,
+    device: str,
+    preferred_model_dir: Path | None = None,
+):
+    resolved_name = resolve_model_name(model)
+    if preferred_model_dir is not None and has_complete_local_whisper_model(preferred_model_dir):
+        return whisper_model_class(str(preferred_model_dir), device=device)
+
+    try:
+        with offline_model_loading():
+            return instantiate_whisper_model(whisper_model_class, resolved_name, local_files_only=True, device=device)
+    except Exception as local_exc:
+        model_dir = preferred_model_dir or get_whisper_model_cache_dir(resolved_name)
+        if has_complete_local_whisper_model(model_dir):
+            return whisper_model_class(str(model_dir), device=device)
+        raise local_exc
+
+
+def load_whisper_model_with_fallback(
+    load_local_model: Callable[[str], object],
+    *,
+    requested_device: str,
+    resolved_device: str,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[object, str]:
+    try:
+        return load_local_model(resolved_device), resolved_device
+    except Exception as exc:
+        if requested_device == "auto" and resolved_device == "cuda" and is_whisper_cuda_runtime_error(exc):
+            notify_progress(
+                progress_callback,
+                WHISPER_MODEL_READY_PROGRESS,
+                "Whisper CUDA runtime is unavailable on this PC. Falling back to CPU automatically.",
+            )
+            return load_local_model("cpu"), "cpu"
+        raise
+
+
 def load_whisper_model(
     model: WhisperModelName,
     progress_callback: ProgressCallback | None = None,
+    pause_controller: PauseController | None = None,
+    *,
+    device: str | None = None,
 ):
     configure_huggingface_hub_http_client()
     try:
@@ -698,16 +961,42 @@ def load_whisper_model(
             "faster-whisper is not installed. Install it with `pip install faster-whisper`."
         ) from exc
 
-    resolved_name = resolve_model_name(model)
-    device = resolve_whisper_device()
+    requested_device = normalize_whisper_device(device or os.environ.get(WHISPER_DEVICE_ENV_VAR, "auto"))
+    resolved_device = resolve_whisper_device(requested_device)
+    manual_model_dir: Path | None = None
+
+    if requested_device == "auto":
+        if resolved_device == "cuda":
+            notify_progress(progress_callback, 88, "Whisper device set to Auto. NVIDIA GPU detected, using CUDA.")
+        else:
+            notify_progress(progress_callback, 88, "Whisper device set to Auto. No compatible NVIDIA GPU detected, using CPU.")
+    elif requested_device == "cuda":
+        notify_progress(progress_callback, 88, "Whisper device set to NVIDIA GPU (CUDA).")
+    else:
+        notify_progress(progress_callback, 88, "Whisper device set to CPU only.")
+
+    def load_local_model(selected_device: str):
+        return open_local_whisper_model(
+            WhisperModel,
+            model,
+            device=selected_device,
+            preferred_model_dir=manual_model_dir,
+        )
 
     try:
-        with offline_model_loading():
-            return instantiate_whisper_model(WhisperModel, resolved_name, local_files_only=True, device=device)
+        loaded_model, active_device = load_whisper_model_with_fallback(
+            load_local_model,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            progress_callback=progress_callback,
+        )
+        return ManagedWhisperModel(
+            inner=loaded_model,
+            requested_device=requested_device,
+            active_device=active_device,
+            load_local_model=load_local_model,
+        )
     except Exception as local_exc:
-        manual_model_dir = get_whisper_model_cache_dir(resolved_name)
-        if has_complete_local_whisper_model(manual_model_dir):
-            return WhisperModel(str(manual_model_dir), device=device)
         if should_use_local_only_whisper_model():
             raise ExtractionRuntimeError(
                 f"Whisper model '{model}' is not available locally. Cache the model before running offline."
@@ -715,28 +1004,44 @@ def load_whisper_model(
 
     notify_progress(
         progress_callback,
-        90,
-        f"Whisper model '{model}' is not cached locally. Downloading it once for future offline use.",
+        WHISPER_MODEL_PREP_PROGRESS,
+        f"Whisper model '{model}' is not cached locally. Starting a one-time download for future offline use.",
     )
     try:
-        downloaded_model = instantiate_whisper_model(WhisperModel, resolved_name, local_files_only=False, device=device)
-    except Exception:
+        manual_model_dir = ensure_local_whisper_model_directory(
+            model,
+            progress_callback=progress_callback,
+            pause_controller=pause_controller,
+        )
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=WHISPER_MODEL_READY_PROGRESS,
+        )
         notify_progress(
             progress_callback,
-            90,
-            f"Whisper Hub download for model '{model}' failed. Retrying with direct download.",
+            WHISPER_MODEL_READY_PROGRESS,
+            f"Opening Whisper model '{model}' from the local cache.",
         )
-        try:
-            model_dir = ensure_local_whisper_model_directory(model, progress_callback=progress_callback)
-            downloaded_model = WhisperModel(str(model_dir), device=device)
-        except Exception as download_exc:
-            detail = summarize_whisper_download_exception(download_exc)
-            raise ExtractionRuntimeError(
-                f"Whisper model '{model}' could not be downloaded automatically. {detail}"
-            ) from download_exc
+        downloaded_model, active_device = load_whisper_model_with_fallback(
+            load_local_model,
+            requested_device=requested_device,
+            resolved_device=resolved_device,
+            progress_callback=progress_callback,
+        )
+    except Exception as download_exc:
+        detail = summarize_whisper_download_exception(download_exc)
+        raise ExtractionRuntimeError(
+            f"Whisper model '{model}' could not be downloaded automatically. {detail}"
+        ) from download_exc
 
-    notify_progress(progress_callback, 92, f"Whisper model '{model}' is ready.")
-    return downloaded_model
+    notify_progress(progress_callback, WHISPER_MODEL_READY_PROGRESS, f"Whisper model '{model}' is ready.")
+    return ManagedWhisperModel(
+        inner=downloaded_model,
+        requested_device=requested_device,
+        active_device=active_device,
+        load_local_model=load_local_model,
+    )
 
 
 def collect_transcribed_cues(
@@ -751,7 +1056,13 @@ def collect_transcribed_cues(
     progress_end: int | None = None,
     expected_duration_seconds: float | None = None,
     progress_message_prefix: str | None = None,
+    pause_controller: PauseController | None = None,
 ) -> list[WhisperCue]:
+    wait_for_whisper_resume(
+        pause_controller,
+        progress_callback=progress_callback,
+        progress=progress_start,
+    )
     try:
         segments, _ = model.transcribe(
             str(audio_path),
@@ -760,13 +1071,35 @@ def collect_transcribed_cues(
             condition_on_previous_text=False,
         )
     except RuntimeError as exc:
-        raw_message = str(exc)
-        normalized_message = raw_message.lower()
-        if "cublas" in normalized_message or "cudnn" in normalized_message or "cuda" in normalized_message:
+        if is_whisper_cuda_runtime_error(exc):
+            fallback_method = getattr(model, "fallback_to_cpu_if_auto", None)
+            if callable(fallback_method):
+                try:
+                    notify_progress(
+                        progress_callback,
+                        progress_start if progress_start is not None else WHISPER_MODEL_READY_PROGRESS,
+                        "Whisper CUDA runtime is unavailable on this PC. Falling back to CPU automatically.",
+                    )
+                    if fallback_method(progress_callback):
+                        return collect_transcribed_cues(
+                            model,
+                            audio_path,
+                            language=language,
+                            vad_filter=vad_filter,
+                            offset_seconds=offset_seconds,
+                            progress_callback=progress_callback,
+                            progress_start=progress_start,
+                            progress_end=progress_end,
+                            expected_duration_seconds=expected_duration_seconds,
+                            progress_message_prefix=progress_message_prefix,
+                            pause_controller=pause_controller,
+                        )
+                except Exception as fallback_exc:
+                    raise ExtractionRuntimeError(f"Whisper CPU fallback failed: {fallback_exc}") from fallback_exc
             raise ExtractionRuntimeError(
-                "Whisper GPU runtime is not available on this PC. The app will run on CPU by default after restart, or set APP_WHISPER_DEVICE=cpu."
+                "Whisper GPU runtime is not available on this PC. Select Auto or CPU only, or set APP_WHISPER_DEVICE=cpu."
             ) from exc
-        raise ExtractionRuntimeError(f"Whisper transcription failed: {raw_message}") from exc
+        raise ExtractionRuntimeError(f"Whisper transcription failed: {exc}") from exc
     except Exception as exc:
         raise ExtractionRuntimeError(f"Whisper transcription failed: {exc}") from exc
 
@@ -774,6 +1107,11 @@ def collect_transcribed_cues(
     last_progress_value: int | None = None
     last_message: str | None = None
     for segment in segments:
+        wait_for_whisper_resume(
+            pause_controller,
+            progress_callback=progress_callback,
+            progress=last_progress_value if last_progress_value is not None else progress_start,
+        )
         text = str(getattr(segment, "text", "") or "").strip()
         start = float(getattr(segment, "start", 0.0) or 0.0) + offset_seconds
         end = float(getattr(segment, "end", 0.0) or 0.0) + offset_seconds
@@ -822,14 +1160,26 @@ def render_whisper_srt(cues: list[WhisperCue]) -> str:
     return "\n\n".join(blocks).strip() + "\n"
 
 
-def normalize_local_whisper_options(options: LocalWhisperSubtitleOptions) -> tuple[str, str, str, int | None, int | None]:
+def normalize_local_whisper_options(
+    options: LocalWhisperSubtitleOptions,
+) -> tuple[str, str, str, str, str, int | None, int | None]:
     normalized_model = normalize_whisper_model(options.model)
     normalized_language = normalize_language_code(options.language)
     normalized_output_format = normalize_output_format(options.output_format)
+    normalized_subtitle_format = normalize_subtitle_format(options.subtitle_format)
+    normalized_device = normalize_whisper_device(options.device)
     start_seconds = parse_time_to_seconds(options.start_time)
     end_seconds = parse_time_to_seconds(options.end_time)
     validate_time_range(start_seconds, end_seconds, None)
-    return normalized_model, normalized_language, normalized_output_format, start_seconds, end_seconds
+    return (
+        normalized_model,
+        normalized_language,
+        normalized_output_format,
+        normalized_subtitle_format,
+        normalized_device,
+        start_seconds,
+        end_seconds,
+    )
 
 
 def transcribe_whisper_audio_file(
@@ -842,8 +1192,17 @@ def transcribe_whisper_audio_file(
     source_duration_seconds: float | None = None,
     source_url: str | None = None,
     resume_state_callback: ResumeStateCallback | None = None,
+    pause_controller: PauseController | None = None,
 ) -> ExtractionResult:
-    normalized_model, normalized_language, normalized_output_format, start_seconds, end_seconds = normalize_local_whisper_options(options)
+    (
+        normalized_model,
+        normalized_language,
+        normalized_output_format,
+        normalized_subtitle_format,
+        normalized_device,
+        start_seconds,
+        end_seconds,
+    ) = normalize_local_whisper_options(options)
     validate_requested_range(start_seconds, end_seconds, source_duration_seconds)
 
     ffmpeg_path = resolve_ffmpeg_path()
@@ -853,6 +1212,11 @@ def transcribe_whisper_audio_file(
     if not source_path.exists() and not whisper_input_path.exists():
         raise ExtractionInputError("The source audio file was not found.")
 
+    wait_for_whisper_resume(
+        pause_controller,
+        progress_callback=progress_callback,
+        progress=84,
+    )
     if whisper_input_path.exists():
         notify_progress(progress_callback, 84, "Reusing cached Whisper WAV input.")
     else:
@@ -868,8 +1232,18 @@ def transcribe_whisper_audio_file(
             whisper_input_path,
         )
 
+    wait_for_whisper_resume(
+        pause_controller,
+        progress_callback=progress_callback,
+        progress=88,
+    )
     notify_progress(progress_callback, 88, "Loading Whisper model.")
-    model = load_whisper_model(normalized_model, progress_callback=progress_callback)
+    model = load_whisper_model(
+        normalized_model,
+        progress_callback=progress_callback,
+        pause_controller=pause_controller,
+        device=normalized_device,
+    )
 
     effective_duration_seconds = calculate_effective_duration(source_duration_seconds, start_seconds, end_seconds)
     if effective_duration_seconds is None:
@@ -882,6 +1256,7 @@ def transcribe_whisper_audio_file(
         model=normalized_model,
         language=normalized_language,
         output_format=normalized_output_format,
+        subtitle_format=normalized_subtitle_format,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
@@ -899,6 +1274,8 @@ def transcribe_whisper_audio_file(
             "model": normalized_model,
             "language": normalized_language,
             "outputFormat": normalized_output_format,
+            "subtitleFormat": normalized_subtitle_format,
+            "whisperDevice": normalized_device,
             "vadFilter": options.vad_filter,
             "startSeconds": start_seconds,
             "endSeconds": end_seconds,
@@ -916,6 +1293,7 @@ def transcribe_whisper_audio_file(
                 "sourceTitle": source_title,
                 "sourcePath": str(source_path),
                 "subtitleDownloadName": download_name,
+                "whisperDevice": normalized_device,
                 "chunkCount": len(chunk_plan) if chunk_plan else 1,
                 "completedChunks": len(completed_chunks),
             }
@@ -930,12 +1308,24 @@ def transcribe_whisper_audio_file(
                 cues.extend(load_saved_whisper_cues(chunk_cues_path))
                 notify_progress(
                     progress_callback,
-                    90 + int((index / len(chunk_plan)) * 9),
+                    WHISPER_TRANSCRIBE_PROGRESS_START
+                    + int((index / len(chunk_plan)) * (WHISPER_TRANSCRIBE_PROGRESS_END - WHISPER_TRANSCRIBE_PROGRESS_START)),
                     f"Recovered completed Whisper audio chunk {index}/{len(chunk_plan)}.",
                 )
                 continue
 
             chunk_path = temp_dir / f"whisper-chunk-{index:03d}.wav"
+            chunk_progress_start = WHISPER_TRANSCRIBE_PROGRESS_START + int(
+                ((index - 1) / len(chunk_plan)) * (WHISPER_TRANSCRIBE_PROGRESS_END - WHISPER_TRANSCRIBE_PROGRESS_START)
+            )
+            chunk_progress_end = WHISPER_TRANSCRIBE_PROGRESS_START + int(
+                (index / len(chunk_plan)) * (WHISPER_TRANSCRIBE_PROGRESS_END - WHISPER_TRANSCRIBE_PROGRESS_START)
+            )
+            wait_for_whisper_resume(
+                pause_controller,
+                progress_callback=progress_callback,
+                progress=chunk_progress_start,
+            )
             if not chunk_path.exists():
                 run_ffmpeg(
                     build_chunk_wav_command(
@@ -948,8 +1338,6 @@ def transcribe_whisper_audio_file(
                     chunk_path,
                 )
 
-            chunk_progress_start = 90 + int(((index - 1) / len(chunk_plan)) * 9)
-            chunk_progress_end = 90 + int((index / len(chunk_plan)) * 9)
             notify_progress(
                 progress_callback,
                 chunk_progress_start,
@@ -966,6 +1354,7 @@ def transcribe_whisper_audio_file(
                 progress_end=max(chunk_progress_start, chunk_progress_end),
                 expected_duration_seconds=chunk_duration,
                 progress_message_prefix=f"Transcribing Whisper audio chunk {index}/{len(chunk_plan)}",
+                pause_controller=pause_controller,
             )
             cues.extend(latest_chunk_cues)
             if latest_chunk_cues:
@@ -978,10 +1367,15 @@ def transcribe_whisper_audio_file(
     else:
         full_cues_path = get_whisper_full_cues_path(temp_dir)
         if full_cues_path.exists():
-            notify_progress(progress_callback, 98, "Recovered completed Whisper transcription.")
+            notify_progress(progress_callback, WHISPER_TRANSCRIBE_PROGRESS_END - 1, "Recovered completed Whisper transcription.")
             cues = load_saved_whisper_cues(full_cues_path)
         else:
-            notify_progress(progress_callback, 94, "Transcribing audio with faster-whisper (0%).")
+            wait_for_whisper_resume(
+                pause_controller,
+                progress_callback=progress_callback,
+                progress=WHISPER_TRANSCRIBE_PROGRESS_START,
+            )
+            notify_progress(progress_callback, WHISPER_TRANSCRIBE_PROGRESS_START, "Transcribing audio with faster-whisper (0%).")
             cues = collect_transcribed_cues(
                 model,
                 whisper_input_path,
@@ -989,10 +1383,11 @@ def transcribe_whisper_audio_file(
                 vad_filter=options.vad_filter,
                 offset_seconds=base_offset_seconds,
                 progress_callback=progress_callback,
-                progress_start=94,
-                progress_end=99,
+                progress_start=WHISPER_TRANSCRIBE_PROGRESS_START,
+                progress_end=WHISPER_TRANSCRIBE_PROGRESS_END,
                 expected_duration_seconds=effective_duration_seconds,
                 progress_message_prefix="Transcribing audio with faster-whisper",
+                pause_controller=pause_controller,
             )
             save_whisper_cues(full_cues_path, cues)
 
@@ -1000,7 +1395,17 @@ def transcribe_whisper_audio_file(
         raise ExtractionRuntimeError("No speech was detected in the selected audio range.")
 
     output_path = temp_dir / download_name
-    output_path.write_text(render_whisper_srt(cues), encoding="utf-8")
+    wait_for_whisper_resume(
+        pause_controller,
+        progress_callback=progress_callback,
+        progress=WHISPER_TRANSCRIBE_PROGRESS_END,
+    )
+    rendered_output = (
+        render_whisper_srt(cues)
+        if normalized_subtitle_format == "timestamped"
+        else render_clean_text_entries([cue.text for cue in cues])
+    )
+    output_path.write_text(rendered_output, encoding="utf-8")
 
     notify_progress(progress_callback, 100, "Whisper subtitle extraction completed.")
     resume_state["status"] = "completed"
@@ -1009,7 +1414,7 @@ def transcribe_whisper_audio_file(
         file_path=output_path,
         download_name=download_name,
         temp_dir=temp_dir,
-        media_type="application/x-subrip; charset=utf-8",
+        media_type=resolve_subtitle_media_type(normalized_subtitle_format),
     )
 
 
@@ -1019,6 +1424,7 @@ def extract_whisper_subtitles(
     *,
     temp_dir: Path | None = None,
     resume_state_callback: ResumeStateCallback | None = None,
+    pause_controller: PauseController | None = None,
 ) -> ExtractionResult:
     normalized_url = validate_youtube_url(options.url)
     owns_temp_dir = temp_dir is None
@@ -1071,6 +1477,8 @@ def extract_whisper_subtitles(
                 model=options.model,
                 language=options.language,
                 output_format=options.output_format,
+                subtitle_format=options.subtitle_format,
+                device=options.device,
                 vad_filter=options.vad_filter,
                 start_time=options.start_time,
                 end_time=options.end_time,
@@ -1080,6 +1488,7 @@ def extract_whisper_subtitles(
             source_duration_seconds=duration_seconds,
             source_url=normalized_url,
             resume_state_callback=resume_state_callback,
+            pause_controller=pause_controller,
         )
     except Exception:
         if owns_temp_dir:
@@ -1095,6 +1504,7 @@ def extract_whisper_subtitles_from_file(
     temp_dir: Path | None = None,
     progress_callback: ProgressCallback | None = None,
     resume_state_callback: ResumeStateCallback | None = None,
+    pause_controller: PauseController | None = None,
 ) -> ExtractionResult:
     validated_name = validate_upload_audio_filename(source_name)
     owns_temp_dir = temp_dir is None
@@ -1122,6 +1532,7 @@ def extract_whisper_subtitles_from_file(
             progress_callback=progress_callback,
             source_duration_seconds=None,
             resume_state_callback=resume_state_callback,
+            pause_controller=pause_controller,
         )
     except Exception:
         if owns_temp_dir:

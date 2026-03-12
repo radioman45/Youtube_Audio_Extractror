@@ -17,6 +17,10 @@ class InlineThread:
         self._target(*self._args)
 
 
+def normalize_newlines(payload: bytes) -> bytes:
+    return payload.replace(b"\r\n", b"\n")
+
+
 def test_healthcheck_exposes_supported_options():
     client = TestClient(app)
 
@@ -30,7 +34,9 @@ def test_healthcheck_exposes_supported_options():
     assert "1080p" in payload["videoQualities"]
     assert "batch" in payload["taskTypes"]
     assert "whisper" in payload["subtitleEngines"]
+    assert "clean" in payload["subtitleFormats"]
     assert "large-v3-turbo" in payload["whisperModels"]
+    assert "auto" in payload["whisperDevices"]
     assert "audio_file" in payload["subtitleSources"]
 
 
@@ -121,16 +127,16 @@ def test_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatch, tmp_p
     captured = {}
     work_dir = tmp_path / "job"
     work_dir.mkdir()
-    output_file = work_dir / "track_en.srt"
-    output_file.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+    output_file = work_dir / "track_en_clean.txt"
+    output_file.write_text("Hello\n", encoding="utf-8")
 
     def fake_extract_subtitles(options):
         captured["options"] = options
         return ExtractionResult(
             file_path=output_file,
-            download_name="track_en.srt",
+            download_name="track_en_clean.txt",
             temp_dir=work_dir,
-            media_type="application/x-subrip; charset=utf-8",
+            media_type="text/plain; charset=utf-8",
         )
 
     monkeypatch.setattr("app.main.extract_subtitles", fake_extract_subtitles)
@@ -141,6 +147,7 @@ def test_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatch, tmp_p
         json={
             "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "subtitleLanguage": "en",
+            "subtitleFormat": "clean",
             "startTime": "00:10",
             "endTime": "00:20",
         },
@@ -148,25 +155,26 @@ def test_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatch, tmp_p
 
     assert response.status_code == 200
     assert captured["options"].subtitle_language == "en"
+    assert captured["options"].subtitle_format == "clean"
     assert captured["options"].start_time == "00:10"
     assert captured["options"].end_time == "00:20"
-    assert b"00:00:00,000" in response.content
+    assert normalize_newlines(response.content) == b"Hello\n"
 
 
 def test_whisper_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatch, tmp_path: Path):
     captured = {}
     work_dir = tmp_path / "job"
     work_dir.mkdir()
-    output_file = work_dir / "track_whisper_ko.srt"
-    output_file.write_text("1\n00:00:00,000 --> 00:00:01,000\n안녕하세요\n", encoding="utf-8")
+    output_file = work_dir / "track_whisper_ko_clean.txt"
+    output_file.write_text("안녕하세요\n", encoding="utf-8")
 
     def fake_extract_whisper_subtitles(options):
         captured["options"] = options
         return ExtractionResult(
             file_path=output_file,
-            download_name="track_whisper_ko.srt",
+            download_name="track_whisper_ko_clean.txt",
             temp_dir=work_dir,
-            media_type="application/x-subrip; charset=utf-8",
+            media_type="text/plain; charset=utf-8",
         )
 
     monkeypatch.setattr("app.main.extract_whisper_subtitles", fake_extract_whisper_subtitles)
@@ -177,7 +185,9 @@ def test_whisper_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatc
         json={
             "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "subtitleEngine": "whisper",
+            "subtitleFormat": "clean",
             "whisperModel": "base",
+            "whisperDevice": "cpu",
             "subtitleLanguage": "ko",
             "vadFilter": False,
         },
@@ -186,8 +196,10 @@ def test_whisper_subtitle_endpoint_accepts_frontend_camel_case_fields(monkeypatc
     assert response.status_code == 200
     assert captured["options"].model == "base"
     assert captured["options"].language == "ko"
+    assert captured["options"].subtitle_format == "clean"
+    assert captured["options"].device == "cpu"
     assert captured["options"].vad_filter is False
-    assert b"00:00:00,000" in response.content
+    assert normalize_newlines(response.content) == "안녕하세요\n".encode("utf-8")
 
 
 def test_generic_video_job_dispatches_and_downloads(monkeypatch, tmp_path: Path):
@@ -246,6 +258,7 @@ def test_generic_batch_job_reports_details(monkeypatch, tmp_path: Path):
 
     def fake_extract_batch(options, progress_callback=None, status_callback=None):
         assert options.batch_mode == "subtitle"
+        assert options.subtitle_format == "clean"
         assert status_callback is not None
         assert progress_callback is not None
         status_callback(3, 0, 0)
@@ -270,6 +283,7 @@ def test_generic_batch_job_reports_details(monkeypatch, tmp_path: Path):
             "batchMode": "subtitle",
             "url": "https://www.youtube.com/playlist?list=PL1234567890",
             "subtitleLanguage": "ko",
+            "subtitleFormat": "clean",
         },
     )
 
@@ -290,12 +304,14 @@ def test_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp_path: Pa
     store = ExtractionJobStore()
     work_dir = tmp_path / "job"
     work_dir.mkdir()
-    output_file = work_dir / "track_whisper_base_ko.srt"
-    output_file.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+    output_file = work_dir / "track_whisper_base_ko_clean.txt"
+    output_file.write_text("Hello\n", encoding="utf-8")
 
     def fake_extract_whisper_subtitles(options, progress_callback=None, temp_dir=None, resume_state_callback=None):
         assert options.model == "base"
         assert options.language == "ko"
+        assert options.subtitle_format == "clean"
+        assert options.device == "cpu"
         assert options.vad_filter is True
         assert progress_callback is not None
         assert temp_dir is not None
@@ -304,9 +320,9 @@ def test_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp_path: Pa
         progress_callback(65, "Transcribing audio with faster-whisper.")
         return ExtractionResult(
             file_path=output_file,
-            download_name="track_whisper_base_ko.srt",
+            download_name="track_whisper_base_ko_clean.txt",
             temp_dir=temp_dir,
-            media_type="application/x-subrip; charset=utf-8",
+            media_type="text/plain; charset=utf-8",
         )
 
     monkeypatch.setattr("app.main.job_store", store)
@@ -320,7 +336,9 @@ def test_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp_path: Pa
             "taskType": "subtitle",
             "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "subtitleEngine": "whisper",
+            "subtitleFormat": "clean",
             "whisperModel": "base",
+            "whisperDevice": "cpu",
             "subtitleLanguage": "ko",
             "vadFilter": True,
         },
@@ -334,11 +352,13 @@ def test_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp_path: Pa
     status_payload = status_response.json()
     assert status_payload["status"] == "completed"
     assert status_payload["details"]["subtitleEngine"] == "whisper"
-    assert status_payload["filename"] == "track_whisper_base_ko.srt"
+    assert status_payload["details"]["subtitleFormat"] == "clean"
+    assert status_payload["details"]["whisperDevice"] == "cpu"
+    assert status_payload["filename"] == "track_whisper_base_ko_clean.txt"
 
     download_response = client.get(status_payload["downloadUrl"])
     assert download_response.status_code == 200
-    assert b"00:00:00,000" in download_response.content
+    assert normalize_newlines(download_response.content) == b"Hello\n"
 
 
 def test_uploaded_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp_path: Path):
@@ -361,13 +381,13 @@ def test_uploaded_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp
         if resume_state_callback is not None:
             resume_state_callback({"completedChunks": 0, "chunkCount": 1})
         progress_callback(72, "Transcribing uploaded audio with faster-whisper.")
-        output_file = temp_dir / "uploaded_whisper_base_ko.srt"
-        output_file.write_text("1\n00:00:00,000 --> 00:00:01,000\nUploaded\n", encoding="utf-8")
+        output_file = temp_dir / "uploaded_whisper_base_ko_clean.txt"
+        output_file.write_text("Uploaded\n", encoding="utf-8")
         return ExtractionResult(
             file_path=output_file,
-            download_name="uploaded_whisper_base_ko.srt",
+            download_name="uploaded_whisper_base_ko_clean.txt",
             temp_dir=temp_dir,
-            media_type="application/x-subrip; charset=utf-8",
+            media_type="text/plain; charset=utf-8",
         )
 
     monkeypatch.setattr("app.main.job_store", store)
@@ -379,7 +399,9 @@ def test_uploaded_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp
         "/api/subtitles/upload/jobs",
         data={
             "whisperModel": "base",
+            "whisperDevice": "cuda",
             "subtitleLanguage": "ko",
+            "subtitleFormat": "clean",
             "vadFilter": "true",
         },
         files={
@@ -393,16 +415,20 @@ def test_uploaded_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp
     assert captured["source_exists"] is True
     assert captured["options"].model == "base"
     assert captured["options"].language == "ko"
+    assert captured["options"].subtitle_format == "clean"
+    assert captured["options"].device == "cuda"
 
     status_response = client.get(f"/api/jobs/{job_id}")
     assert status_response.status_code == 200
     status_payload = status_response.json()
     assert status_payload["status"] == "completed"
     assert status_payload["details"]["subtitleSource"] == "upload"
+    assert status_payload["details"]["subtitleFormat"] == "clean"
+    assert status_payload["details"]["whisperDevice"] == "cuda"
 
     download_response = client.get(status_payload["downloadUrl"])
     assert download_response.status_code == 200
-    assert b"Uploaded" in download_response.content
+    assert normalize_newlines(download_response.content) == b"Uploaded\n"
 
 
 def test_job_endpoint_rejects_batch_without_mode():
@@ -503,6 +529,7 @@ def test_resume_pending_jobs_restarts_whisper_url_job(monkeypatch, tmp_path: Pat
             "workDir": str(work_dir),
             "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "whisperModel": "base",
+            "whisperDevice": "cpu",
             "subtitleLanguage": "ko",
             "vadFilter": True,
             "startTime": None,
@@ -523,3 +550,4 @@ def test_resume_pending_jobs_restarts_whisper_url_job(monkeypatch, tmp_path: Pat
     assert started
     assert started[0][0] == "run_whisper_url_job"
     assert started[0][1][0] == job_id
+    assert started[0][1][1].device == "cpu"

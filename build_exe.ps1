@@ -8,21 +8,21 @@ if (-not (Test-Path $python)) {
     throw ".venv\Scripts\python.exe not found. Create the virtual environment first."
 }
 
-& $python -m PyInstaller `
-    --noconfirm `
-    --onedir `
-    --name "YouTubeAudioExtractorDesktop" `
-    --collect-all faster_whisper `
-    --collect-all ctranslate2 `
-    --collect-all tokenizers `
-    --collect-data huggingface_hub `
-    --collect-binaries onnxruntime `
-    --collect-data onnxruntime `
-    --collect-all av `
-    --collect-all imageio_ffmpeg `
-    --collect-all yt_dlp `
-    launcher.py
+$runningProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessName -in @("YouTubeAudioExtractor", "YouTubeAudioExtractorDesktop")
+}
+if ($runningProcesses) {
+    $runningProcesses | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
 
+& $python -m PyInstaller --noconfirm --clean "YouTubeAudioExtractor.spec"
+
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+& (Join-Path $root "create_desktop_shortcut.ps1")
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

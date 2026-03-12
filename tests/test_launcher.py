@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.services.extractor import ExtractionResult
-from launcher import build_stylesheet, compute_visibility, ensure_unique_path, persist_result
+from launcher import build_stylesheet, compute_visibility, ensure_unique_path, persist_result, supports_pause_resume
 
 
 def test_compute_visibility_for_audio_task():
@@ -10,6 +10,8 @@ def test_compute_visibility_for_audio_task():
     assert visibility["url"] is True
     assert visibility["audio_format"] is True
     assert visibility["video_quality"] is False
+    assert visibility["subtitle_format"] is False
+    assert visibility["whisper_device"] is False
     assert visibility["audio_file"] is False
 
 
@@ -18,8 +20,16 @@ def test_compute_visibility_for_uploaded_whisper_subtitles():
 
     assert visibility["url"] is False
     assert visibility["subtitle_source"] is True
+    assert visibility["subtitle_format"] is True
     assert visibility["whisper_model"] is True
+    assert visibility["whisper_device"] is True
     assert visibility["audio_file"] is True
+
+
+def test_supports_pause_resume_only_for_whisper_subtitles():
+    assert supports_pause_resume("subtitle", "whisper") is True
+    assert supports_pause_resume("subtitle", "youtube") is False
+    assert supports_pause_resume("audio", "whisper") is False
 
 
 def test_ensure_unique_path_appends_suffix(tmp_path: Path):

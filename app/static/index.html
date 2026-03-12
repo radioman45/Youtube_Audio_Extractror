@@ -134,6 +134,14 @@
                   </select>
                 </label>
 
+                <label class="field hidden" id="subtitle-format-field">
+                  <span>자막 형식</span>
+                  <select id="subtitleFormat" name="subtitleFormat">
+                    <option value="timestamped" selected>타임스탬프 포함 (.srt)</option>
+                    <option value="clean">텍스트만 (.txt)</option>
+                  </select>
+                </label>
+
                 <label class="field hidden" id="whisper-model-field">
                   <span>Whisper 모델</span>
                   <select id="whisperModel" name="whisperModel">
@@ -144,6 +152,15 @@
                     <option value="large">large</option>
                     <option value="large-v3">large-v3</option>
                     <option value="large-v3-turbo">large-v3-turbo</option>
+                  </select>
+                </label>
+
+                <label class="field hidden" id="whisper-device-field">
+                  <span>Whisper device</span>
+                  <select id="whisperDevice" name="whisperDevice">
+                    <option value="auto" selected>Auto (GPU first, else CPU)</option>
+                    <option value="cpu">CPU only</option>
+                    <option value="cuda">NVIDIA GPU (CUDA)</option>
                   </select>
                 </label>
               </div>
