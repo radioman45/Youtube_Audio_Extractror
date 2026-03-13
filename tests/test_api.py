@@ -1,3 +1,6 @@
+import io
+import json
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -21,6 +24,41 @@ def normalize_newlines(payload: bytes) -> bytes:
     return payload.replace(b"\r\n", b"\n")
 
 
+def make_colab_result_zip(
+    *,
+    job_id: str,
+    source_sha256: str,
+    download_name: str,
+    subtitle_format: str,
+    content: str,
+    whisper_model: str = "large-v3-turbo",
+) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(download_name, content.encode("utf-8"))
+        archive.writestr(
+            "result.json",
+            json.dumps(
+                {
+                    "jobId": job_id,
+                    "sourceSha256": source_sha256,
+                    "subtitleFormat": subtitle_format,
+                    "downloadName": download_name,
+                    "resultFile": download_name,
+                    "whisperModel": whisper_model,
+                    "device": "cuda",
+                    "language": "ko",
+                    "segmentCount": 3,
+                    "durationSeconds": 42.5,
+                    "generator": "pytest-colab",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    return buffer.getvalue()
+
+
 def test_healthcheck_exposes_supported_options():
     client = TestClient(app)
 
@@ -37,7 +75,9 @@ def test_healthcheck_exposes_supported_options():
     assert "clean" in payload["subtitleFormats"]
     assert "large-v3-turbo" in payload["whisperModels"]
     assert "auto" in payload["whisperDevices"]
+    assert "colab" in payload["whisperRuntimes"]
     assert "audio_file" in payload["subtitleSources"]
+    assert payload["colab"]["enabled"] is True
 
 
 def test_extract_endpoint_accepts_frontend_camel_case_fields(monkeypatch, tmp_path: Path):
@@ -431,6 +471,163 @@ def test_uploaded_whisper_subtitle_job_dispatches_and_downloads(monkeypatch, tmp
     assert normalize_newlines(download_response.content) == b"Uploaded\n"
 
 
+def test_uploaded_colab_job_creates_bundle_and_notebook(monkeypatch, tmp_path: Path):
+    store = ExtractionJobStore(state_dir=tmp_path / "state")
+
+    def fake_get_job_work_dir(job_id: str) -> Path:
+        work_dir = tmp_path / job_id / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return work_dir
+
+    monkeypatch.setattr("app.main.job_store", store)
+    monkeypatch.setattr("app.main.get_job_work_dir", fake_get_job_work_dir)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/api/subtitles/upload/colab/jobs",
+        data={
+            "whisperModel": "large-v3-turbo",
+            "whisperDevice": "cuda",
+            "subtitleLanguage": "ko",
+            "subtitleFormat": "timestamped",
+            "vadFilter": "true",
+        },
+        files={
+            "file": ("sample.mp3", b"audio-bytes", "audio/mpeg"),
+        },
+    )
+
+    assert create_response.status_code == 202
+    payload = create_response.json()
+    assert payload["status"] == "waiting_for_colab"
+    assert payload["details"]["whisperRuntime"] == "colab"
+    assert payload["details"]["bundleDownloadUrl"].endswith("/bundle")
+    assert payload["details"]["resultUploadUrl"].endswith("/complete")
+
+    bundle_response = client.get(payload["details"]["bundleDownloadUrl"])
+    assert bundle_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(bundle_response.content)) as archive:
+        assert "manifest.json" in archive.namelist()
+        assert "result-schema.json" in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+    assert manifest["jobId"] == payload["jobId"]
+    assert manifest["sourceSha256"] == payload["details"]["sourceSha256"]
+
+    notebook_response = client.get(payload["details"]["notebookDownloadUrl"])
+    assert notebook_response.status_code == 200
+    assert b"WhisperModel" in notebook_response.content
+    assert b"drive.mount" in notebook_response.content
+    assert b"USE_GOOGLE_DRIVE = False" in notebook_response.content
+    assert b"DRIVE_BUNDLE_PATH" in notebook_response.content
+
+
+def test_uploaded_colab_job_imports_result_zip(monkeypatch, tmp_path: Path):
+    store = ExtractionJobStore(state_dir=tmp_path / "state")
+
+    def fake_get_job_work_dir(job_id: str) -> Path:
+        work_dir = tmp_path / job_id / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return work_dir
+
+    monkeypatch.setattr("app.main.job_store", store)
+    monkeypatch.setattr("app.main.get_job_work_dir", fake_get_job_work_dir)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/api/subtitles/upload/colab/jobs",
+        data={
+            "whisperModel": "large-v3-turbo",
+            "whisperDevice": "cuda",
+            "subtitleLanguage": "ko",
+            "subtitleFormat": "clean",
+            "vadFilter": "true",
+        },
+        files={
+            "file": ("sample.mp3", b"audio-bytes", "audio/mpeg"),
+        },
+    )
+
+    assert create_response.status_code == 202
+    created = create_response.json()
+    result_zip = make_colab_result_zip(
+        job_id=created["jobId"],
+        source_sha256=created["details"]["sourceSha256"],
+        download_name=created["details"]["colabResultName"],
+        subtitle_format="clean",
+        content="Imported from Colab\n",
+    )
+
+    complete_response = client.post(
+        created["details"]["resultUploadUrl"],
+        files={
+            "file": ("colab-result.zip", result_zip, "application/zip"),
+        },
+    )
+
+    assert complete_response.status_code == 200
+    completed = complete_response.json()
+    assert completed["status"] == "completed"
+    assert completed["details"]["whisperRuntime"] == "colab"
+    assert completed["details"]["resultModel"] == "large-v3-turbo"
+    assert completed["filename"] == created["details"]["colabResultName"]
+
+    download_response = client.get(completed["downloadUrl"])
+    assert download_response.status_code == 200
+    assert normalize_newlines(download_response.content) == b"Imported from Colab\n"
+
+
+def test_uploaded_colab_job_rejects_mismatched_result_zip(monkeypatch, tmp_path: Path):
+    store = ExtractionJobStore(state_dir=tmp_path / "state")
+
+    def fake_get_job_work_dir(job_id: str) -> Path:
+        work_dir = tmp_path / job_id / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        return work_dir
+
+    monkeypatch.setattr("app.main.job_store", store)
+    monkeypatch.setattr("app.main.get_job_work_dir", fake_get_job_work_dir)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/api/subtitles/upload/colab/jobs",
+        data={
+            "whisperModel": "large-v3-turbo",
+            "whisperDevice": "cuda",
+            "subtitleLanguage": "ko",
+            "subtitleFormat": "timestamped",
+        },
+        files={
+            "file": ("sample.mp3", b"audio-bytes", "audio/mpeg"),
+        },
+    )
+
+    assert create_response.status_code == 202
+    created = create_response.json()
+    result_zip = make_colab_result_zip(
+        job_id=created["jobId"],
+        source_sha256="not-the-right-sha",
+        download_name=created["details"]["colabResultName"],
+        subtitle_format="timestamped",
+        content="1\n00:00:00,000 --> 00:00:01,000\nMismatch\n",
+    )
+
+    complete_response = client.post(
+        created["details"]["resultUploadUrl"],
+        files={
+            "file": ("colab-result.zip", result_zip, "application/zip"),
+        },
+    )
+
+    assert complete_response.status_code == 400
+    assert "different source file" in complete_response.json()["detail"]
+
+    status_response = client.get(f"/api/jobs/{created['jobId']}")
+    assert status_response.status_code == 200
+    status_payload = status_response.json()
+    assert status_payload["status"] == "waiting_for_colab"
+    assert "lastImportError" in status_payload["details"]
+
+
 def test_job_endpoint_rejects_batch_without_mode():
     client = TestClient(app)
 
@@ -456,6 +653,23 @@ def test_job_endpoint_rejects_batch_whisper_subtitle():
             "url": "https://www.youtube.com/playlist?list=PL1234567890",
             "subtitleEngine": "whisper",
             "whisperModel": "base",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_job_endpoint_rejects_colab_runtime_for_url_whisper():
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/jobs",
+        json={
+            "taskType": "subtitle",
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "subtitleEngine": "whisper",
+            "whisperRuntime": "colab",
+            "whisperModel": "large-v3-turbo",
         },
     )
 

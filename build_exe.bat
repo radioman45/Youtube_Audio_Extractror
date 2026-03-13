@@ -18,6 +18,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build completed: dist\YouTubeAudioExtractor.exe
+echo Build completed under: dist\
 echo Desktop shortcuts updated on: %USERPROFILE%\Desktop
 pause

@@ -22,6 +22,7 @@ BatchMode = Literal["audio", "song_mp3", "video", "subtitle"]
 SubtitleEngine = Literal["youtube", "whisper"]
 SubtitleFormat = Literal["timestamped", "clean"]
 WhisperDevice = Literal["auto", "cpu", "cuda"]
+WhisperRuntime = Literal["local", "colab"]
 
 
 class RequestBase(BaseModel):
@@ -71,6 +72,7 @@ class SubtitleRequest(RequestBase):
     subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
     whisper_device: WhisperDevice = "auto"
+    whisper_runtime: WhisperRuntime = "local"
     vad_filter: bool = True
 
     @field_validator("subtitle_language")
@@ -98,6 +100,12 @@ class SubtitleRequest(RequestBase):
     def validate_whisper_device_name(cls, value: str) -> str:
         return normalize_whisper_device(value)
 
+    @model_validator(mode="after")
+    def validate_runtime_support(self) -> Self:
+        if self.whisper_runtime == "colab":
+            raise ValueError("Colab runtime is only supported for uploaded audio subtitle jobs.")
+        return self
+
 
 class JobRequest(RequestBase):
     task_type: TaskType
@@ -108,6 +116,7 @@ class JobRequest(RequestBase):
     subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
     whisper_device: WhisperDevice = "auto"
+    whisper_runtime: WhisperRuntime = "local"
     vad_filter: bool = True
     batch_mode: BatchMode | None = None
 
@@ -156,4 +165,6 @@ class JobRequest(RequestBase):
             raise ValueError("batchMode is required for batch tasks.")
         if self.task_type == "batch" and self.batch_mode == "subtitle" and self.subtitle_engine == "whisper":
             raise ValueError("Whisper subtitle generation is only supported for single-video subtitle tasks.")
+        if self.whisper_runtime == "colab":
+            raise ValueError("Colab runtime is only supported for uploaded audio subtitle jobs.")
         return self

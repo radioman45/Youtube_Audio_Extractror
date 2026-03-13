@@ -163,6 +163,14 @@
                     <option value="cuda">NVIDIA GPU (CUDA)</option>
                   </select>
                 </label>
+
+                <label class="field hidden" id="whisper-runtime-field">
+                  <span>Whisper runtime</span>
+                  <select id="whisperRuntime" name="whisperRuntime">
+                    <option value="local" selected>Local PC (current app)</option>
+                    <option value="colab">Google Colab manual handoff</option>
+                  </select>
+                </label>
               </div>
 
               <div class="field-grid">
@@ -252,6 +260,53 @@
                 </div>
               </div>
             </div>
+
+            <section id="colab-panel" class="colab-panel hidden" aria-live="polite">
+              <div class="colab-panel__header">
+                <div>
+                  <p class="colab-panel__eyebrow">Google Colab Handoff</p>
+                  <h3 class="colab-panel__title">Manual GPU transcription for uploaded audio</h3>
+                </div>
+                <span id="colab-status-badge" class="colab-status-badge">Idle</span>
+              </div>
+
+              <p id="colab-panel-copy" class="colab-panel__copy">
+                Submit first to create a Colab bundle. Then run the notebook in Colab, upload the bundle ZIP there, and import the returned result ZIP back here.
+              </p>
+
+              <div class="colab-steps">
+                <span class="colab-step">1. Create bundle</span>
+                <span class="colab-step">2. Run notebook in Colab</span>
+                <span class="colab-step">3. Import result ZIP</span>
+              </div>
+
+              <div class="colab-meta">
+                <div class="colab-meta__item">
+                  <span class="colab-meta__label">Job</span>
+                  <strong id="colab-job-id">Not created</strong>
+                </div>
+                <div class="colab-meta__item">
+                  <span class="colab-meta__label">Bundle</span>
+                  <strong id="colab-bundle-name">Submit first</strong>
+                </div>
+                <div class="colab-meta__item">
+                  <span class="colab-meta__label">Result ZIP</span>
+                  <strong id="colab-result-name">colab-result.zip</strong>
+                </div>
+              </div>
+
+              <div class="colab-actions">
+                <button id="colab-download-bundle" class="secondary-button" type="button" disabled>Download bundle</button>
+                <button id="colab-download-notebook" class="secondary-button" type="button">Download notebook</button>
+                <button id="colab-open-home" class="secondary-button" type="button">Open Colab</button>
+                <button id="colab-import-result" class="primary-button" type="button" disabled>Import result ZIP</button>
+              </div>
+
+              <input id="colab-result-file" type="file" accept=".zip,application/zip" class="hidden" />
+              <p id="colab-panel-help" class="helper-text colab-panel__help">
+                This flow stays manual on purpose. The app prepares the job package and validates the result ZIP when you import it back.
+              </p>
+            </section>
 
             <div class="action-row">
               <button id="submit-button" class="primary-button" type="submit">오디오 추출 시작</button>

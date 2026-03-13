@@ -13,7 +13,7 @@ from app.services.app_state import get_jobs_state_dir
 from app.services.extractor import ExtractionResult, cleanup_temp_dir
 
 
-JobStatus = Literal["queued", "processing", "completed", "failed"]
+JobStatus = Literal["queued", "processing", "waiting_for_colab", "importing_result", "completed", "failed"]
 
 
 @dataclass(slots=True)
@@ -205,6 +205,30 @@ class ExtractionJobStore:
 
             job.status = "processing"
             job.progress = max(job.progress, normalized_progress)
+            job.message = message
+            if details:
+                job.details.update(details)
+            job.updated_at = time.time()
+            self._persist_job_locked(job)
+
+    def set_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        progress: int,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_progress = max(0, min(100, int(progress)))
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in {"completed", "failed"}:
+                return
+
+            job.status = status
+            job.progress = normalized_progress
             job.message = message
             if details:
                 job.details.update(details)

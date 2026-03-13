@@ -9,13 +9,22 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from app.models import ExtractRequest, JobRequest, SubtitleRequest
 from app.services.app_state import get_job_work_dir
 from app.services.batch_extractor import BatchExtractionOptions, extract_batch
+from app.services.colab_transcription import (
+    COLAB_BUNDLE_FILENAME,
+    COLAB_HOME_URL,
+    COLAB_NOTEBOOK_FILENAME,
+    COLAB_RESULT_FILENAME,
+    create_colab_job_bundle,
+    build_colab_notebook_payload,
+    import_colab_result_package,
+)
 from app.services.extraction_jobs import ExtractionJobStore
 from app.services.extractor import (
     SUPPORTED_FORMATS,
@@ -114,6 +123,7 @@ def build_whisper_resume_details(
     payload: dict[str, object] = {
         "taskType": "subtitle",
         "subtitleEngine": "whisper",
+        "whisperRuntime": "local",
         "subtitleSource": subtitle_source,
         "resumeSupported": True,
         "workDir": str(work_dir),
@@ -132,6 +142,51 @@ def build_whisper_resume_details(
     if source_path is not None:
         payload["sourcePath"] = str(source_path)
     return payload
+
+
+def build_colab_job_details(
+    *,
+    job_id: str,
+    work_dir: Path,
+    source_name: str,
+    source_path: Path,
+    bundle_download_name: str,
+    source_sha256: str,
+    result_name: str,
+    options: LocalWhisperSubtitleOptions,
+) -> dict[str, object]:
+    return {
+        "taskType": "subtitle",
+        "subtitleEngine": "whisper",
+        "whisperRuntime": "colab",
+        "subtitleSource": "upload",
+        "resumeSupported": False,
+        "workDir": str(work_dir),
+        "sourceName": source_name,
+        "sourcePath": str(source_path),
+        "whisperModel": options.model,
+        "whisperDevice": options.device,
+        "subtitleLanguage": options.language,
+        "subtitleFormat": options.subtitle_format,
+        "vadFilter": options.vad_filter,
+        "startTime": options.start_time,
+        "endTime": options.end_time,
+        "sourceSha256": source_sha256,
+        "bundleDownloadUrl": f"/api/subtitles/colab/jobs/{job_id}/bundle",
+        "bundleFilename": bundle_download_name,
+        "resultUploadUrl": f"/api/subtitles/colab/jobs/{job_id}/complete",
+        "notebookDownloadUrl": "/api/subtitles/colab/notebook",
+        "colabHomeUrl": COLAB_HOME_URL,
+        "colabResultName": result_name,
+    }
+
+
+def store_uploaded_source_file(work_dir: Path, upload: UploadFile, source_name: str) -> Path:
+    suffix = Path(source_name).suffix.lower()
+    source_path = work_dir / f"uploaded-source{suffix}"
+    with source_path.open("wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+    return source_path
 
 
 def start_background_job(target, *args) -> None:
@@ -223,6 +278,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
             }
             if payload.subtitle_engine == "whisper":
                 details["whisperDevice"] = payload.whisper_device
+                details["whisperRuntime"] = "local"
         elif payload.task_type == "batch":
 
             def batch_progress(progress: int, message: str) -> None:
@@ -313,6 +369,7 @@ def run_whisper_url_job(
             details={
                 "taskType": "subtitle",
                 "subtitleEngine": "whisper",
+                "whisperRuntime": "local",
                 "subtitleSource": "youtube_url",
                 "subtitleFormat": options.subtitle_format,
                 "whisperDevice": options.device,
@@ -350,6 +407,7 @@ def run_uploaded_whisper_job(
             details={
                 "taskType": "subtitle",
                 "subtitleEngine": "whisper",
+                "whisperRuntime": "local",
                 "subtitleSource": "upload",
                 "subtitleFormat": options.subtitle_format,
                 "whisperDevice": options.device,
@@ -434,7 +492,14 @@ def healthcheck() -> dict[str, object]:
         "subtitleFormats": list(SUPPORTED_SUBTITLE_FORMATS),
         "whisperModels": list(SUPPORTED_WHISPER_MODELS),
         "whisperDevices": list(SUPPORTED_WHISPER_DEVICES),
+        "whisperRuntimes": ["local", "colab"],
         "subtitleSources": ["youtube_url", "audio_file"],
+        "colab": {
+            "enabled": True,
+            "homeUrl": COLAB_HOME_URL,
+            "notebookFilename": COLAB_NOTEBOOK_FILENAME,
+            "uploadOnly": True,
+        },
         "recommendedWhisperModels": {
             "default": "base",
             "longVideo": "base",
@@ -452,6 +517,7 @@ def create_job(payload: JobRequest) -> dict[str, object]:
         details["subtitleFormat"] = payload.subtitle_format
         if payload.subtitle_engine == "whisper":
             details["whisperDevice"] = payload.whisper_device
+            details["whisperRuntime"] = "local"
     if payload.task_type == "batch":
         details.update({"batchMode": payload.batch_mode, "total": 0, "completed": 0, "failed": 0})
 
@@ -532,17 +598,19 @@ async def create_uploaded_whisper_job(
 
     job = job_store.create_job(
         message="Uploaded audio is being prepared.",
-        details={"taskType": "subtitle", "subtitleEngine": "whisper", "subtitleSource": "upload"},
+        details={
+            "taskType": "subtitle",
+            "subtitleEngine": "whisper",
+            "subtitleSource": "upload",
+            "whisperRuntime": "local",
+        },
         download_path_template="/api/jobs/{job_id}/download",
     )
     job_id = str(job["jobId"])
     work_dir = get_job_work_dir(job_id)
 
     try:
-        suffix = Path(source_name).suffix.lower()
-        source_path = work_dir / f"uploaded-source{suffix}"
-        with source_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        source_path = store_uploaded_source_file(work_dir, file, source_name)
     except Exception as exc:
         job_store.delete_job(job_id)
         raise HTTPException(status_code=400, detail="Failed to store the uploaded audio file.") from exc
@@ -571,6 +639,198 @@ async def create_uploaded_whisper_job(
     )
     start_background_job(run_uploaded_whisper_job, job_id, source_path, source_name, options, work_dir)
     return job
+
+
+@app.post("/api/subtitles/upload/colab/jobs", status_code=202)
+async def create_uploaded_colab_job(
+    file: UploadFile = File(...),
+    whisper_model: str = Form("large-v3-turbo", alias="whisperModel"),
+    whisper_device: str = Form("cuda", alias="whisperDevice"),
+    subtitle_language: str = Form("ko", alias="subtitleLanguage"),
+    subtitle_format: str = Form("timestamped", alias="subtitleFormat"),
+    vad_filter: bool = Form(True, alias="vadFilter"),
+    start_time: str | None = Form(None, alias="startTime"),
+    end_time: str | None = Form(None, alias="endTime"),
+) -> dict[str, object]:
+    try:
+        source_name = validate_upload_audio_filename(file.filename or "")
+    except ExtractionInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        options = LocalWhisperSubtitleOptions(
+            model=whisper_model,
+            language=subtitle_language,
+            subtitle_format=subtitle_format,
+            device=whisper_device,
+            vad_filter=vad_filter,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        normalize_local_whisper_options(options)
+    except ExtractionInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = job_store.create_job(
+        message="Preparing Colab package.",
+        details={
+            "taskType": "subtitle",
+            "subtitleEngine": "whisper",
+            "subtitleSource": "upload",
+            "whisperRuntime": "colab",
+        },
+        download_path_template="/api/jobs/{job_id}/download",
+    )
+    job_id = str(job["jobId"])
+    work_dir = get_job_work_dir(job_id)
+
+    try:
+        source_path = store_uploaded_source_file(work_dir, file, source_name)
+        bundle_info = create_colab_job_bundle(
+            job_id=job_id,
+            source_path=source_path,
+            source_name=source_name,
+            options=options,
+            work_dir=work_dir,
+        )
+    except ExtractionInputError as exc:
+        job_store.delete_job(job_id)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        job_store.delete_job(job_id)
+        raise HTTPException(status_code=400, detail="Failed to prepare the Colab package.") from exc
+    finally:
+        await file.close()
+
+    if not source_path.exists() or source_path.stat().st_size == 0:
+        job_store.delete_job(job_id)
+        raise HTTPException(status_code=400, detail="The uploaded audio file is empty.")
+
+    details = build_colab_job_details(
+        job_id=job_id,
+        work_dir=work_dir,
+        source_name=source_name,
+        source_path=source_path,
+        bundle_download_name=bundle_info.bundle_download_name,
+        source_sha256=bundle_info.source_sha256,
+        result_name=bundle_info.expected_output_name,
+        options=options,
+    )
+    job_store.set_status(
+        job_id,
+        "waiting_for_colab",
+        progress=15,
+        message="Colab package is ready. Download it, run the notebook, and import the result ZIP.",
+        details=details,
+    )
+    payload = job_store.get_response(job_id)
+    if payload is None:
+        raise HTTPException(status_code=500, detail="The Colab job could not be created.")
+    return payload
+
+
+@app.get("/api/subtitles/colab/notebook")
+def download_colab_notebook() -> Response:
+    payload = build_colab_notebook_payload()
+    headers = {
+        "Content-Disposition": f'attachment; filename="{COLAB_NOTEBOOK_FILENAME}"',
+    }
+    return Response(payload, media_type="application/x-ipynb+json", headers=headers)
+
+
+@app.get("/api/subtitles/colab/jobs/{job_id}/bundle")
+def download_colab_bundle(job_id: str) -> FileResponse:
+    job = get_job_or_404(job_id, "/api/jobs/{job_id}/download")
+    details = dict(job.get("details") or {})
+    if details.get("whisperRuntime") != "colab":
+        raise HTTPException(status_code=404, detail="Colab bundle not found for this job.")
+
+    bundle_path = Path(str(details.get("workDir") or "")) / COLAB_BUNDLE_FILENAME
+    if not bundle_path.exists():
+        raise HTTPException(status_code=404, detail="Colab bundle file not found.")
+
+    return FileResponse(
+        path=bundle_path,
+        media_type="application/zip",
+        filename=str(details.get("bundleFilename") or bundle_path.name),
+    )
+
+
+@app.post("/api/subtitles/colab/jobs/{job_id}/complete")
+async def complete_colab_job(job_id: str, file: UploadFile = File(...)) -> dict[str, object]:
+    job = get_job_or_404(job_id, "/api/jobs/{job_id}/download")
+    details = dict(job.get("details") or {})
+    if details.get("whisperRuntime") != "colab":
+        raise HTTPException(status_code=404, detail="Colab result import is not available for this job.")
+
+    work_dir_value = details.get("workDir")
+    if not isinstance(work_dir_value, str) or not work_dir_value:
+        raise HTTPException(status_code=400, detail="The Colab job is missing its working directory.")
+
+    work_dir = Path(work_dir_value)
+    upload_path = work_dir / COLAB_RESULT_FILENAME
+
+    try:
+        with upload_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Failed to store the Colab result ZIP.") from exc
+    finally:
+        await file.close()
+
+    if not upload_path.exists() or upload_path.stat().st_size == 0:
+        raise HTTPException(status_code=400, detail="The uploaded Colab result ZIP is empty.")
+
+    job_store.set_status(
+        job_id,
+        "importing_result",
+        progress=90,
+        message="Importing Colab result package.",
+    )
+
+    try:
+        result, imported_details = import_colab_result_package(
+            package_path=upload_path,
+            work_dir=work_dir,
+            job_id=job_id,
+            expected_details=details,
+        )
+    except ExtractionInputError as exc:
+        job_store.set_status(
+            job_id,
+            "waiting_for_colab",
+            progress=15,
+            message="Waiting for a valid Colab result package.",
+            details={"lastImportError": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        job_store.set_status(
+            job_id,
+            "failed",
+            progress=max(int(job.get("progress") or 0), 15),
+            message="An unexpected error occurred while importing the Colab result package.",
+        )
+        raise HTTPException(status_code=500, detail="Unexpected Colab result import failure.") from exc
+
+    job_store.complete_job(
+        job_id,
+        result,
+        message="Colab subtitle import completed.",
+        details={
+            "taskType": "subtitle",
+            "subtitleEngine": "whisper",
+            "subtitleSource": "upload",
+            "whisperRuntime": "colab",
+            "subtitleFormat": details.get("subtitleFormat"),
+            "whisperDevice": details.get("whisperDevice"),
+            **imported_details,
+        },
+    )
+    payload = job_store.get_response(job_id)
+    if payload is None:
+        raise HTTPException(status_code=500, detail="The Colab job could not be completed.")
+    return payload
 
 
 @app.get("/api/jobs/{job_id}")

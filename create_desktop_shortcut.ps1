@@ -1,9 +1,14 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$target = Join-Path $root "dist\YouTubeAudioExtractor.exe"
-if (-not (Test-Path $target)) {
-    throw "Target executable not found: $target"
+$candidates = @(
+    (Join-Path $root "dist\YouTubeAudioExtractor.exe"),
+    (Join-Path $root "dist\YouTubeAudioExtractor\YouTubeAudioExtractor.exe"),
+    (Join-Path $root "dist\YouTubeAudioExtractorDesktop\YouTubeAudioExtractorDesktop.exe")
+)
+$target = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $target) {
+    throw "Target executable not found in dist output."
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")

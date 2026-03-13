@@ -374,6 +374,130 @@ select:disabled,
   color: var(--muted);
 }
 
+.colab-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.03), transparent 38%),
+    var(--card);
+}
+
+.colab-panel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.colab-panel__eyebrow {
+  margin: 0 0 6px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.colab-panel__title {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.colab-panel__copy,
+.colab-panel__help {
+  margin: 0;
+}
+
+.colab-status-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--muted-bg);
+  color: var(--foreground);
+  font-size: 0.8rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.colab-status-badge[data-state="waiting_for_colab"] {
+  background: rgba(2, 132, 199, 0.12);
+  color: #0369a1;
+}
+
+.colab-status-badge[data-state="importing_result"] {
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+}
+
+.colab-status-badge[data-state="completed"] {
+  background: rgba(22, 101, 52, 0.12);
+  color: var(--success);
+}
+
+.colab-status-badge[data-state="failed"] {
+  background: rgba(185, 28, 28, 0.12);
+  color: var(--error);
+}
+
+.colab-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.colab-step {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: var(--muted-bg);
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.colab-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.colab-meta__item {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted-bg);
+}
+
+.colab-meta__label {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.colab-meta__item strong {
+  overflow-wrap: anywhere;
+  font-size: 0.9rem;
+}
+
+.colab-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .progress-shell {
   display: grid;
   gap: 10px;
@@ -480,8 +604,14 @@ select:disabled,
   .field-grid,
   .folder-row,
   .action-row,
-  .batch-summary {
+  .batch-summary,
+  .colab-meta,
+  .colab-actions {
     grid-template-columns: 1fr;
+  }
+
+  .colab-panel__header {
+    flex-direction: column;
   }
 
   .status-text {
