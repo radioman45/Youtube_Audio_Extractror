@@ -31,6 +31,10 @@ TIMING_LINE_PATTERN = re.compile(
 )
 
 
+class SubtitleTrackNotFoundError(ExtractionInputError):
+    """Raised when the video does not expose a matching subtitle track."""
+
+
 @dataclass(slots=True)
 class SubtitleCue:
     start: float
@@ -87,7 +91,7 @@ def resolve_subtitle_track(info: dict[str, object], language: SubtitleLanguage) 
         if matched is not None:
             return matched, True
 
-    raise ExtractionInputError("선택한 언어의 자막을 찾지 못했습니다.")
+    raise SubtitleTrackNotFoundError("선택한 언어의 자막을 찾지 못했습니다.")
 
 
 def download_subtitle_file(

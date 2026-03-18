@@ -19,7 +19,7 @@ from app.services.time_utils import parse_timestamp, validate_time_range
 
 TaskType = Literal["audio", "song_mp3", "video", "subtitle", "batch"]
 BatchMode = Literal["audio", "song_mp3", "video", "subtitle"]
-SubtitleEngine = Literal["youtube", "whisper"]
+SubtitleEngine = Literal["auto", "youtube", "whisper"]
 SubtitleFormat = Literal["timestamped", "clean"]
 WhisperDevice = Literal["auto", "cpu", "cuda"]
 WhisperRuntime = Literal["local", "colab"]
@@ -68,7 +68,7 @@ class ExtractRequest(RequestBase):
 
 class SubtitleRequest(RequestBase):
     subtitle_language: str = "ko"
-    subtitle_engine: SubtitleEngine = "youtube"
+    subtitle_engine: SubtitleEngine = "auto"
     subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
     whisper_device: WhisperDevice = "auto"
@@ -112,7 +112,7 @@ class JobRequest(RequestBase):
     audio_format: str = "mp3"
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
-    subtitle_engine: SubtitleEngine = "youtube"
+    subtitle_engine: SubtitleEngine = "auto"
     subtitle_format: SubtitleFormat = "timestamped"
     whisper_model: str = "base"
     whisper_device: WhisperDevice = "auto"
@@ -163,8 +163,11 @@ class JobRequest(RequestBase):
     def validate_conditional_fields(self) -> Self:
         if self.task_type == "batch" and self.batch_mode is None:
             raise ValueError("batchMode is required for batch tasks.")
-        if self.task_type == "batch" and self.batch_mode == "subtitle" and self.subtitle_engine == "whisper":
-            raise ValueError("Whisper subtitle generation is only supported for single-video subtitle tasks.")
+        if self.task_type == "batch" and self.batch_mode == "subtitle":
+            if self.subtitle_engine == "whisper":
+                raise ValueError("Whisper subtitle generation is only supported for single-video subtitle tasks.")
+            if self.subtitle_engine == "auto":
+                self.subtitle_engine = "youtube"
         if self.whisper_runtime == "colab":
             raise ValueError("Colab runtime is only supported for uploaded audio subtitle jobs.")
         return self

@@ -48,7 +48,7 @@ from app.services.extractor import (
     extract_audio,
     extract_song_mp3,
 )
-from app.services.subtitle_extractor import SubtitleOptions, extract_subtitles
+from app.services.subtitle_extractor import SubtitleOptions, SubtitleTrackNotFoundError, extract_subtitles
 from app.services.task_control import PauseController
 from app.services.video_extractor import VideoExtractionOptions, extract_video
 from app.services.whisper_subtitle_extractor import (
@@ -75,6 +75,7 @@ BATCH_OPTIONS: tuple[tuple[str, str], ...] = (
     ("subtitle", "자막 추출"),
 )
 SUBTITLE_ENGINE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("auto", "자동 선택"),
     ("youtube", "YouTube 자막"),
     ("whisper", "Whisper 로컬 생성"),
 )
@@ -612,6 +613,35 @@ def execute_task(
                 progress_callback=progress_callback,
                 pause_controller=pause_controller,
             )
+        elif config.subtitle_engine == "auto":
+            progress_callback(8, "YouTube 자막을 먼저 확인하는 중입니다.")
+            try:
+                result = extract_subtitles(
+                    SubtitleOptions(
+                        url=config.url or "",
+                        subtitle_language=config.subtitle_language,
+                        subtitle_format=config.subtitle_format,
+                        start_time=config.start_time,
+                        end_time=config.end_time,
+                    )
+                )
+                progress_callback(100, "YouTube 자막 추출이 완료되었습니다.")
+            except SubtitleTrackNotFoundError:
+                progress_callback(12, "YouTube 자막이 없어 Whisper 로컬 생성으로 전환합니다.")
+                result = extract_whisper_subtitles(
+                    WhisperSubtitleOptions(
+                        url=config.url or "",
+                        model=config.whisper_model,
+                        language=config.subtitle_language,
+                        subtitle_format=config.subtitle_format,
+                        device=config.whisper_device,
+                        vad_filter=config.vad_filter,
+                        start_time=config.start_time,
+                        end_time=config.end_time,
+                    ),
+                    progress_callback=progress_callback,
+                    pause_controller=pause_controller,
+                )
         else:
             progress_callback(8, "YouTube 자막을 다운로드하는 중입니다.")
             result = extract_subtitles(
@@ -957,7 +987,7 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(self.batch_label)
 
         helper = QLabel(
-            "시간 입력은 비워 두면 전체 구간을 처리합니다. Whisper 업로드 모드에서는 YouTube 링크 대신 오디오 파일만 사용합니다."
+            "시간 입력은 비워 두면 전체 구간을 처리합니다. 자동 선택은 YouTube 자막을 먼저 찾고, 없으면 Whisper 로컬 생성으로 전환합니다. Whisper 업로드 모드에서는 YouTube 링크 대신 오디오 파일만 사용합니다."
         )
         helper.setWordWrap(True)
         helper.setObjectName("helperLabel")

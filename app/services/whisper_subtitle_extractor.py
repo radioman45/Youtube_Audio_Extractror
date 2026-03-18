@@ -45,7 +45,7 @@ WhisperModelName = str
 WhisperOutputFormat = str
 WhisperDevice = str
 
-SUPPORTED_SUBTITLE_ENGINES: tuple[SubtitleEngine, ...] = ("youtube", "whisper")
+SUPPORTED_SUBTITLE_ENGINES: tuple[SubtitleEngine, ...] = ("auto", "youtube", "whisper")
 SUPPORTED_WHISPER_MODELS: tuple[WhisperModelName, ...] = (
     "tiny",
     "base",

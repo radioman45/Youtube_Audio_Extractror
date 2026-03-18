@@ -90,8 +90,8 @@ const MODE_CONFIG = {
   },
   subtitle: {
     label: "자막 추출",
-    title: "YouTube 자막을 받거나 Whisper로 로컬 SRT를 생성합니다.",
-    description: "Whisper 로컬 생성은 YouTube 링크 또는 업로드한 오디오 파일 모두 지원합니다.",
+    title: "YouTube 자막을 먼저 찾고, 없으면 Whisper로 이어집니다.",
+    description: "자동 선택은 YouTube 자막 다운로드를 먼저 시도하고, 실패하면 로컬 Whisper 전사로 전환합니다.",
     submitLabel: "자막 추출 시작",
     doneLabel: "자막 추출이 완료되었습니다.",
   },
@@ -459,7 +459,10 @@ function syncSubtitleUi() {
     subtitleEngineHelp.textContent = "배치 자막은 현재 YouTube 자막 다운로드만 지원합니다.";
   } else if (showEngine) {
     subtitleEngineHelp.classList.remove("hidden");
-    subtitleEngineHelp.textContent = "YouTube 제공 자막이 없으면 Whisper 로컬 생성을 선택하세요.";
+    subtitleEngineHelp.textContent =
+      subtitleEngineSelect.value === "auto"
+        ? "자동 선택은 YouTube 자막을 먼저 시도하고, 자막이 없으면 기본 Whisper 설정으로 전환합니다. Whisper 옵션을 직접 바꾸려면 'Whisper 로컬 생성'을 선택하세요."
+        : "YouTube 제공 자막이 없으면 Whisper 로컬 생성을 선택하세요.";
   } else {
     subtitleEngineHelp.classList.add("hidden");
     subtitleEngineHelp.textContent = "";
@@ -672,10 +675,14 @@ function buildJsonPayload() {
         subtitleFormat === "clean"
           ? subtitleEngine === "whisper"
             ? "youtube-whisper-subtitles.txt"
-            : "youtube-subtitles.txt"
+            : subtitleEngine === "auto"
+              ? "youtube-auto-subtitles.txt"
+              : "youtube-subtitles.txt"
           : subtitleEngine === "whisper"
             ? "youtube-whisper-subtitles.srt"
-            : "youtube-subtitles.srt",
+            : subtitleEngine === "auto"
+              ? "youtube-auto-subtitles.srt"
+              : "youtube-subtitles.srt",
       body: JSON.stringify({
         ...commonPayload,
         subtitleEngine,

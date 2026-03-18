@@ -6,6 +6,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -38,7 +39,12 @@ from app.services.extractor import (
     extract_audio,
     extract_song_mp3,
 )
-from app.services.subtitle_extractor import SUPPORTED_SUBTITLE_FORMATS, SubtitleOptions, extract_subtitles
+from app.services.subtitle_extractor import (
+    SUPPORTED_SUBTITLE_FORMATS,
+    SubtitleOptions,
+    SubtitleTrackNotFoundError,
+    extract_subtitles,
+)
 from app.services.video_extractor import VideoExtractionOptions, extract_video
 from app.services.whisper_subtitle_extractor import (
     LocalWhisperSubtitleOptions,
@@ -119,10 +125,13 @@ def build_whisper_resume_details(
     url: str | None = None,
     source_name: str | None = None,
     source_path: Path | None = None,
+    requested_subtitle_engine: str = "whisper",
+    resolved_subtitle_engine: str | None = None,
+    resolved_subtitle_path: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "taskType": "subtitle",
-        "subtitleEngine": "whisper",
+        "subtitleEngine": requested_subtitle_engine,
         "whisperRuntime": "local",
         "subtitleSource": subtitle_source,
         "resumeSupported": True,
@@ -135,6 +144,10 @@ def build_whisper_resume_details(
         "startTime": start_time,
         "endTime": end_time,
     }
+    if resolved_subtitle_engine:
+        payload["resolvedSubtitleEngine"] = resolved_subtitle_engine
+    if resolved_subtitle_path:
+        payload["resolvedSubtitlePath"] = resolved_subtitle_path
     if url:
         payload["url"] = url
     if source_name:
@@ -142,6 +155,123 @@ def build_whisper_resume_details(
     if source_path is not None:
         payload["sourcePath"] = str(source_path)
     return payload
+
+
+def build_youtube_subtitle_options(payload: SubtitleRequest | JobRequest) -> SubtitleOptions:
+    return SubtitleOptions(
+        url=payload.url,
+        subtitle_language=payload.subtitle_language,
+        subtitle_format=payload.subtitle_format,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+    )
+
+
+def build_whisper_url_options(payload: SubtitleRequest | JobRequest) -> WhisperSubtitleOptions:
+    return WhisperSubtitleOptions(
+        url=payload.url,
+        model=payload.whisper_model,
+        language=payload.subtitle_language,
+        subtitle_format=payload.subtitle_format,
+        device=payload.whisper_device,
+        vad_filter=payload.vad_filter,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+    )
+
+
+def build_subtitle_completion_details(
+    *,
+    requested_engine: str,
+    subtitle_format: str,
+    resolved_engine: str,
+    resolved_path: str,
+    whisper_device: str | None = None,
+    subtitle_source: str = "youtube_url",
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "taskType": "subtitle",
+        "subtitleEngine": requested_engine,
+        "subtitleFormat": subtitle_format,
+        "subtitleSource": subtitle_source,
+        "resolvedSubtitleEngine": resolved_engine,
+        "resolvedSubtitlePath": resolved_path,
+    }
+    if resolved_engine == "whisper":
+        details["whisperDevice"] = whisper_device or "auto"
+        details["whisperRuntime"] = "local"
+    return details
+
+
+def execute_subtitle_request(
+    payload: SubtitleRequest | JobRequest,
+    *,
+    progress_callback: Callable[[int, str], None] | None = None,
+    whisper_temp_dir: Path | None = None,
+    prepare_whisper_temp_dir: Callable[[], Path | None] | None = None,
+    resume_state_callback: Callable[[dict[str, object]], None] | None = None,
+    route_update_callback: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[ExtractionResult, dict[str, object], str]:
+    requested_engine = payload.subtitle_engine
+
+    def update_route(resolved_engine: str, resolved_path: str) -> dict[str, object]:
+        details = build_subtitle_completion_details(
+            requested_engine=requested_engine,
+            subtitle_format=payload.subtitle_format,
+            resolved_engine=resolved_engine,
+            resolved_path=resolved_path,
+            whisper_device=payload.whisper_device,
+            subtitle_source="youtube_url",
+        )
+        if route_update_callback is not None:
+            route_update_callback(details)
+        return details
+
+    def resolve_whisper_temp_dir() -> Path | None:
+        if whisper_temp_dir is not None:
+            return whisper_temp_dir
+        if prepare_whisper_temp_dir is not None:
+            return prepare_whisper_temp_dir()
+        return None
+
+    if requested_engine == "youtube":
+        if progress_callback is not None:
+            progress_callback(8, "Downloading YouTube captions.")
+        result = extract_subtitles(build_youtube_subtitle_options(payload))
+        details = update_route("youtube", "youtube_caption")
+        return result, details, "Subtitle extraction completed."
+
+    if requested_engine == "whisper":
+        resolved_temp_dir = resolve_whisper_temp_dir()
+        details = update_route("whisper", "local_whisper")
+        result = extract_whisper_subtitles(
+            build_whisper_url_options(payload),
+            progress_callback=progress_callback,
+            temp_dir=resolved_temp_dir,
+            resume_state_callback=resume_state_callback,
+        )
+        return result, details, "Whisper subtitle extraction completed."
+
+    if progress_callback is not None:
+        progress_callback(8, "Checking YouTube captions before Whisper transcription.")
+
+    try:
+        result = extract_subtitles(build_youtube_subtitle_options(payload))
+    except SubtitleTrackNotFoundError:
+        if progress_callback is not None:
+            progress_callback(12, "No YouTube captions found. Falling back to Whisper transcription.")
+        resolved_temp_dir = resolve_whisper_temp_dir()
+        details = update_route("whisper", "local_whisper")
+        result = extract_whisper_subtitles(
+            build_whisper_url_options(payload),
+            progress_callback=progress_callback,
+            temp_dir=resolved_temp_dir,
+            resume_state_callback=resume_state_callback,
+        )
+        return result, details, "Whisper subtitle extraction completed."
+
+    details = update_route("youtube", "youtube_caption")
+    return result, details, "Subtitle extraction completed."
 
 
 def build_colab_job_details(
@@ -245,40 +375,11 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
             details = {"taskType": payload.task_type}
         elif payload.task_type == "subtitle":
             job_store.update_progress(job_id, 10, "Preparing subtitle extraction.")
-            if payload.subtitle_engine == "whisper":
-                result = extract_whisper_subtitles(
-                    WhisperSubtitleOptions(
-                        url=payload.url,
-                        model=payload.whisper_model,
-                        language=payload.subtitle_language,
-                        subtitle_format=payload.subtitle_format,
-                        device=payload.whisper_device,
-                        vad_filter=payload.vad_filter,
-                        start_time=payload.start_time,
-                        end_time=payload.end_time,
-                    ),
-                    progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
-                )
-                success_message = "Whisper subtitle extraction completed."
-            else:
-                result = extract_subtitles(
-                    SubtitleOptions(
-                        url=payload.url,
-                        subtitle_language=payload.subtitle_language,
-                        subtitle_format=payload.subtitle_format,
-                        start_time=payload.start_time,
-                        end_time=payload.end_time,
-                    )
-                )
-                success_message = "Subtitle extraction completed."
-            details = {
-                "taskType": payload.task_type,
-                "subtitleEngine": payload.subtitle_engine,
-                "subtitleFormat": payload.subtitle_format,
-            }
-            if payload.subtitle_engine == "whisper":
-                details["whisperDevice"] = payload.whisper_device
-                details["whisperRuntime"] = "local"
+            result, details, success_message = execute_subtitle_request(
+                payload,
+                progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
+                route_update_callback=lambda details: job_store.merge_details(job_id, details),
+            )
         elif payload.task_type == "batch":
 
             def batch_progress(progress: int, message: str) -> None:
@@ -343,17 +444,47 @@ def run_audio_job(job_id: str, payload: ExtractRequest) -> None:
         job_store.complete_job(job_id, result, message="Audio extraction completed.", details={"taskType": "audio"})
 
 
-def run_whisper_url_job(
+def run_subtitle_url_job(
     job_id: str,
-    options: WhisperSubtitleOptions,
-    work_dir: Path,
+    payload: JobRequest,
+    work_dir: Path | None = None,
 ) -> None:
+    whisper_work_dir = work_dir
+
+    def prepare_whisper_temp_dir() -> Path | None:
+        nonlocal whisper_work_dir
+        if whisper_work_dir is not None:
+            return whisper_work_dir
+
+        whisper_work_dir = get_job_work_dir(job_id)
+        job_store.merge_details(
+            job_id,
+            build_whisper_resume_details(
+                work_dir=whisper_work_dir,
+                model=payload.whisper_model,
+                whisper_device=payload.whisper_device,
+                language=payload.subtitle_language,
+                subtitle_format=payload.subtitle_format,
+                vad_filter=payload.vad_filter,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+                subtitle_source="youtube_url",
+                url=payload.url,
+                requested_subtitle_engine=payload.subtitle_engine,
+                resolved_subtitle_engine="whisper",
+                resolved_subtitle_path="local_whisper",
+            ),
+        )
+        return whisper_work_dir
+
     try:
-        result = extract_whisper_subtitles(
-            options,
+        result, details, success_message = execute_subtitle_request(
+            payload,
             progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
-            temp_dir=work_dir,
+            whisper_temp_dir=work_dir,
+            prepare_whisper_temp_dir=prepare_whisper_temp_dir if work_dir is None else None,
             resume_state_callback=lambda details: job_store.merge_details(job_id, details),
+            route_update_callback=lambda details: job_store.merge_details(job_id, details),
         )
     except ExtractionInputError as exc:
         job_store.fail_job(job_id, str(exc))
@@ -362,19 +493,30 @@ def run_whisper_url_job(
     except Exception as exc:
         job_store.fail_job(job_id, f"An unexpected error occurred while processing the request: {exc}")
     else:
-        job_store.complete_job(
-            job_id,
-            result,
-            message="Whisper subtitle extraction completed.",
-            details={
-                "taskType": "subtitle",
-                "subtitleEngine": "whisper",
-                "whisperRuntime": "local",
-                "subtitleSource": "youtube_url",
-                "subtitleFormat": options.subtitle_format,
-                "whisperDevice": options.device,
-            },
-        )
+        job_store.complete_job(job_id, result, message=success_message, details=details)
+
+
+def run_whisper_url_job(
+    job_id: str,
+    options: WhisperSubtitleOptions,
+    work_dir: Path,
+) -> None:
+    run_subtitle_url_job(
+        job_id,
+        JobRequest(
+            task_type="subtitle",
+            url=options.url,
+            subtitle_engine="whisper",
+            subtitle_language=options.language,
+            subtitle_format=options.subtitle_format,
+            whisper_model=options.model,
+            whisper_device=options.device,
+            vad_filter=options.vad_filter,
+            start_time=options.start_time,
+            end_time=options.end_time,
+        ),
+        work_dir,
+    )
 
 
 def run_uploaded_whisper_job(
@@ -422,7 +564,7 @@ def resume_pending_jobs() -> None:
             job_store.fail_job(job.job_id, "This in-progress job cannot be resumed after app restart.")
             continue
 
-        if details.get("taskType") != "subtitle" or details.get("subtitleEngine") != "whisper":
+        if details.get("taskType") != "subtitle":
             job_store.fail_job(job.job_id, "This in-progress job cannot be resumed after app restart.")
             continue
 
@@ -457,14 +599,16 @@ def resume_pending_jobs() -> None:
             continue
 
         start_background_job(
-            run_whisper_url_job,
+            run_subtitle_url_job,
             job.job_id,
-            WhisperSubtitleOptions(
+            JobRequest(
+                task_type="subtitle",
                 url=str(details.get("url") or ""),
-                model=str(details.get("whisperModel") or "base"),
-                language=str(details.get("subtitleLanguage") or "ko"),
+                subtitle_engine=str(details.get("resolvedSubtitleEngine") or details.get("subtitleEngine") or "whisper"),
+                subtitle_language=str(details.get("subtitleLanguage") or "ko"),
                 subtitle_format=str(details.get("subtitleFormat") or "timestamped"),
-                device=str(details.get("whisperDevice") or "auto"),
+                whisper_model=str(details.get("whisperModel") or "base"),
+                whisper_device=str(details.get("whisperDevice") or "auto"),
                 vad_filter=bool(details.get("vadFilter", True)),
                 start_time=str(details.get("startTime")) if details.get("startTime") is not None else None,
                 end_time=str(details.get("endTime")) if details.get("endTime") is not None else None,
@@ -543,22 +687,24 @@ def create_job(payload: JobRequest) -> dict[str, object]:
                 end_time=payload.end_time,
                 subtitle_source="youtube_url",
                 url=payload.url,
+                requested_subtitle_engine=payload.subtitle_engine,
+                resolved_subtitle_engine="whisper",
+                resolved_subtitle_path="local_whisper",
             ),
         )
         start_background_job(
-            run_whisper_url_job,
+            run_subtitle_url_job,
             job_id,
-            WhisperSubtitleOptions(
-                url=payload.url,
-                model=payload.whisper_model,
-                language=payload.subtitle_language,
-                subtitle_format=payload.subtitle_format,
-                device=payload.whisper_device,
-                vad_filter=payload.vad_filter,
-                start_time=payload.start_time,
-                end_time=payload.end_time,
-            ),
+            payload,
             work_dir,
+        )
+        return job
+
+    if payload.task_type == "subtitle" and payload.subtitle_engine == "auto":
+        start_background_job(
+            run_subtitle_url_job,
+            job_id,
+            payload,
         )
         return job
 
@@ -879,29 +1025,7 @@ def download_extract_job(job_id: str) -> FileResponse:
 @app.post("/api/subtitles")
 def extract_subtitles_endpoint(payload: SubtitleRequest) -> FileResponse:
     try:
-        if payload.subtitle_engine == "whisper":
-            result = extract_whisper_subtitles(
-                WhisperSubtitleOptions(
-                    url=payload.url,
-                    model=payload.whisper_model,
-                    language=payload.subtitle_language,
-                    subtitle_format=payload.subtitle_format,
-                    device=payload.whisper_device,
-                    vad_filter=payload.vad_filter,
-                    start_time=payload.start_time,
-                    end_time=payload.end_time,
-                )
-            )
-        else:
-            result = extract_subtitles(
-                SubtitleOptions(
-                    url=payload.url,
-                    subtitle_language=payload.subtitle_language,
-                    subtitle_format=payload.subtitle_format,
-                    start_time=payload.start_time,
-                    end_time=payload.end_time,
-                )
-            )
+        result, _, _ = execute_subtitle_request(payload)
     except ExtractionInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ExtractionRuntimeError as exc:

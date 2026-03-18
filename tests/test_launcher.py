@@ -40,6 +40,17 @@ def test_compute_visibility_for_uploaded_whisper_subtitles():
     assert visibility["colab_actions"] is False
 
 
+def test_compute_visibility_for_auto_subtitles_hides_whisper_controls():
+    visibility = compute_visibility("subtitle", "audio", "auto", "youtube_url", "local")
+
+    assert visibility["url"] is True
+    assert visibility["subtitle_engine"] is True
+    assert visibility["subtitle_source"] is False
+    assert visibility["whisper_model"] is False
+    assert visibility["whisper_device"] is False
+    assert visibility["whisper_runtime"] is False
+
+
 def test_compute_visibility_for_colab_uploaded_whisper_subtitles():
     visibility = compute_visibility("subtitle", "audio", "whisper", "audio_file", "colab")
 
