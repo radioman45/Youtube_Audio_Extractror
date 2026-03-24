@@ -29,6 +29,8 @@ from app.services.colab_transcription import (
 from app.services.extraction_jobs import ExtractionJobStore
 from app.services.extractor import (
     SUPPORTED_FORMATS,
+    SUPPORTED_MP3_BITRATES,
+    SUPPORTED_SPLIT_SIZES_MB,
     SUPPORTED_VIDEO_QUALITIES,
     ExtractionInputError,
     ExtractionOptions,
@@ -164,6 +166,17 @@ def build_youtube_subtitle_options(payload: SubtitleRequest | JobRequest) -> Sub
         subtitle_format=payload.subtitle_format,
         start_time=payload.start_time,
         end_time=payload.end_time,
+    )
+
+
+def build_audio_extraction_options(payload: ExtractRequest | JobRequest) -> ExtractionOptions:
+    return ExtractionOptions(
+        url=payload.url,
+        audio_format=payload.audio_format,  # type: ignore[arg-type]
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        mp3_bitrate=payload.mp3_bitrate,
+        split_size_mb=payload.split_size_mb,
     )
 
 
@@ -340,12 +353,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
     try:
         if payload.task_type == "audio":
             result = extract_audio(
-                ExtractionOptions(
-                    url=payload.url,
-                    audio_format=payload.audio_format,  # type: ignore[arg-type]
-                    start_time=payload.start_time,
-                    end_time=payload.end_time,
-                ),
+                build_audio_extraction_options(payload),
                 progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
             )
             success_message = "Audio extraction completed."
@@ -396,6 +404,8 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
                     url=payload.url,
                     batch_mode=payload.batch_mode or "audio",
                     audio_format=payload.audio_format,
+                    mp3_bitrate=payload.mp3_bitrate,
+                    split_size_mb=payload.split_size_mb,
                     video_quality=payload.video_quality,
                     subtitle_language=payload.subtitle_language,
                     subtitle_format=payload.subtitle_format,
@@ -426,12 +436,7 @@ def dispatch_job(job_id: str, payload: JobRequest) -> None:
 def run_audio_job(job_id: str, payload: ExtractRequest) -> None:
     try:
         result = extract_audio(
-            ExtractionOptions(
-                url=payload.url,
-                audio_format=payload.audio_format,  # type: ignore[arg-type]
-                start_time=payload.start_time,
-                end_time=payload.end_time,
-            ),
+            build_audio_extraction_options(payload),
             progress_callback=lambda progress, message: job_store.update_progress(job_id, progress, message),
         )
     except ExtractionInputError as exc:
@@ -629,6 +634,8 @@ def healthcheck() -> dict[str, object]:
         "name": "YouTube Multi Extractor",
         "formats": list(SUPPORTED_FORMATS),
         "audioFormats": list(SUPPORTED_FORMATS),
+        "mp3Bitrates": list(SUPPORTED_MP3_BITRATES),
+        "splitSizesMb": list(SUPPORTED_SPLIT_SIZES_MB),
         "videoQualities": list(SUPPORTED_VIDEO_QUALITIES),
         "taskTypes": ["audio", "song_mp3", "video", "subtitle", "batch"],
         "batchModes": ["audio", "song_mp3", "video", "subtitle"],
@@ -1042,14 +1049,7 @@ def extract_subtitles_endpoint(payload: SubtitleRequest) -> FileResponse:
 @app.post("/api/extract")
 def extract_endpoint(payload: ExtractRequest) -> FileResponse:
     try:
-        result = extract_audio(
-            ExtractionOptions(
-                url=payload.url,
-                audio_format=payload.audio_format,  # type: ignore[arg-type]
-                start_time=payload.start_time,
-                end_time=payload.end_time,
-            )
-        )
+        result = extract_audio(build_audio_extraction_options(payload))
     except ExtractionInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ExtractionRuntimeError as exc:

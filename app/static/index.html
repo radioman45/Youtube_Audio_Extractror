@@ -90,6 +90,31 @@
                   </select>
                 </label>
 
+                <label class="field hidden" id="mp3-bitrate-field">
+                  <span>MP3 bitrate</span>
+                  <select id="mp3Bitrate" name="mp3Bitrate">
+                    <option value="" selected>Default (VBR)</option>
+                    <option value="320k">320 kbps</option>
+                    <option value="256k">256 kbps</option>
+                    <option value="192k">192 kbps</option>
+                    <option value="128k">128 kbps</option>
+                    <option value="96k">96 kbps</option>
+                    <option value="64k">64 kbps</option>
+                  </select>
+                </label>
+
+                <label class="field hidden" id="split-size-field">
+                  <span>Split size</span>
+                  <select id="splitSizeMb" name="splitSizeMb">
+                    <option value="" selected>No split</option>
+                    <option value="100">100 MB</option>
+                    <option value="50">50 MB</option>
+                    <option value="25">25 MB</option>
+                    <option value="10">10 MB</option>
+                    <option value="5">5 MB</option>
+                  </select>
+                </label>
+
                 <label class="field hidden" id="video-quality-field">
                   <span>영상 화질</span>
                   <select id="videoQuality" name="videoQuality">
@@ -103,6 +128,8 @@
                   </select>
                 </label>
               </div>
+
+              <p id="audio-processing-help" class="helper-text hidden"></p>
 
               <div class="field-grid">
                 <label class="field hidden" id="subtitle-engine-field">

@@ -7,6 +7,8 @@ from app.services.extractor import (
     SUPPORTED_FORMATS,
     SUPPORTED_VIDEO_QUALITIES,
     is_supported_youtube_url,
+    normalize_mp3_bitrate,
+    normalize_split_size_mb,
 )
 from app.services.subtitle_extractor import normalize_language_code, normalize_subtitle_format
 from app.services.whisper_subtitle_extractor import (
@@ -57,6 +59,8 @@ class RequestBase(BaseModel):
 
 class ExtractRequest(RequestBase):
     audio_format: str = "mp3"
+    mp3_bitrate: str | None = None
+    split_size_mb: int | None = None
 
     @field_validator("audio_format")
     @classmethod
@@ -64,6 +68,25 @@ class ExtractRequest(RequestBase):
         if value not in SUPPORTED_FORMATS:
             raise ValueError("Unsupported audio format.")
         return value
+
+    @field_validator("mp3_bitrate")
+    @classmethod
+    def validate_mp3_bitrate(cls, value: str | None) -> str | None:
+        return normalize_mp3_bitrate(value)
+
+    @field_validator("split_size_mb")
+    @classmethod
+    def validate_split_size_mb(cls, value: int | None) -> int | None:
+        return normalize_split_size_mb(value)
+
+    @model_validator(mode="after")
+    def validate_audio_processing_options(self) -> Self:
+        if self.audio_format != "mp3":
+            if self.mp3_bitrate is not None:
+                raise ValueError("MP3 bitrate is only available for MP3 output.")
+            if self.split_size_mb is not None:
+                raise ValueError("File splitting is only available for MP3 output.")
+        return self
 
 
 class SubtitleRequest(RequestBase):
@@ -110,6 +133,8 @@ class SubtitleRequest(RequestBase):
 class JobRequest(RequestBase):
     task_type: TaskType
     audio_format: str = "mp3"
+    mp3_bitrate: str | None = None
+    split_size_mb: int | None = None
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
     subtitle_engine: SubtitleEngine = "auto"
@@ -126,6 +151,16 @@ class JobRequest(RequestBase):
         if value not in SUPPORTED_FORMATS:
             raise ValueError("Unsupported audio format.")
         return value
+
+    @field_validator("mp3_bitrate")
+    @classmethod
+    def validate_job_mp3_bitrate(cls, value: str | None) -> str | None:
+        return normalize_mp3_bitrate(value)
+
+    @field_validator("split_size_mb")
+    @classmethod
+    def validate_job_split_size_mb(cls, value: int | None) -> int | None:
+        return normalize_split_size_mb(value)
 
     @field_validator("video_quality")
     @classmethod
@@ -170,4 +205,17 @@ class JobRequest(RequestBase):
                 self.subtitle_engine = "youtube"
         if self.whisper_runtime == "colab":
             raise ValueError("Colab runtime is only supported for uploaded audio subtitle jobs.")
+        uses_audio_processing = self.task_type == "audio" or (
+            self.task_type == "batch" and self.batch_mode == "audio"
+        )
+        if not uses_audio_processing:
+            if self.mp3_bitrate is not None:
+                raise ValueError("MP3 bitrate is only available for audio extraction.")
+            if self.split_size_mb is not None:
+                raise ValueError("File splitting is only available for audio extraction.")
+        elif self.audio_format != "mp3":
+            if self.mp3_bitrate is not None:
+                raise ValueError("MP3 bitrate is only available for MP3 output.")
+            if self.split_size_mb is not None:
+                raise ValueError("File splitting is only available for MP3 output.")
         return self

@@ -41,6 +41,8 @@ class BatchExtractionOptions:
     url: str
     batch_mode: BatchOperation
     audio_format: str = "mp3"
+    mp3_bitrate: str | None = None
+    split_size_mb: int | None = None
     video_quality: str = "1080p"
     subtitle_language: str = "ko"
     subtitle_format: str = "timestamped"
@@ -170,6 +172,8 @@ def extract_batch(
                             audio_format=options.audio_format,  # type: ignore[arg-type]
                             start_time=options.start_time,
                             end_time=options.end_time,
+                            mp3_bitrate=options.mp3_bitrate,
+                            split_size_mb=options.split_size_mb,
                         ),
                         progress_callback=item_progress,
                     )

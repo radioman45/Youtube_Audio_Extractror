@@ -40,6 +40,9 @@ from app.services.colab_transcription import (
 )
 from app.services.extractor import (
     SUPPORTED_FORMATS,
+    SUPPORTED_MP3_BITRATES,
+    SUPPORTED_SPLIT_SIZES_MB,
+    DEFAULT_SPLIT_MP3_BITRATE,
     SUPPORTED_VIDEO_QUALITIES,
     ExtractionOptions,
     ExtractionResult,
@@ -108,6 +111,12 @@ ROW_LABEL_MIN_WIDTH = 170
 COMPACT_LAYOUT_BREAKPOINT = 940
 STACKED_BUTTON_BREAKPOINT = 1180
 STACKED_TOPBAR_BREAKPOINT = 780
+MP3_BITRATE_OPTIONS: tuple[tuple[str, str], ...] = (("", "자동 (기본)"),) + tuple(
+    (value, value.upper()) for value in SUPPORTED_MP3_BITRATES
+)
+SPLIT_SIZE_OPTIONS: tuple[tuple[str, str], ...] = (("", "분할 안 함"),) + tuple(
+    (str(value), f"{value} MB") for value in SUPPORTED_SPLIT_SIZES_MB
+)
 
 
 def build_colab_help_message(bundle_name: str | None = None) -> str:
@@ -196,6 +205,8 @@ class TaskConfig:
     start_time: str | None
     end_time: str | None
     audio_format: str
+    mp3_bitrate: str | None
+    split_size_mb: int | None
     video_quality: str
     subtitle_engine: str
     subtitle_source: str
@@ -555,6 +566,8 @@ def execute_task(
                 audio_format=config.audio_format,  # type: ignore[arg-type]
                 start_time=config.start_time,
                 end_time=config.end_time,
+                mp3_bitrate=config.mp3_bitrate,
+                split_size_mb=config.split_size_mb,
             ),
             progress_callback=progress_callback,
         )
@@ -660,6 +673,8 @@ def execute_task(
                     url=config.url or "",
                     batch_mode=config.batch_mode,
                     audio_format=config.audio_format,
+                    mp3_bitrate=config.mp3_bitrate,
+                    split_size_mb=config.split_size_mb,
                     video_quality=config.video_quality,
                     subtitle_language=config.subtitle_language,
                     subtitle_format=config.subtitle_format,
@@ -875,6 +890,19 @@ class MainWindow(QMainWindow):
         self.audio_format_row = Row("오디오 형식", self.audio_format_combo)
         panel_layout.addWidget(self.audio_format_row)
 
+        self.mp3_bitrate_combo = self._combo(MP3_BITRATE_OPTIONS)
+        self.mp3_bitrate_row = Row("MP3 비트레이트", self.mp3_bitrate_combo)
+        panel_layout.addWidget(self.mp3_bitrate_row)
+
+        self.split_size_combo = self._combo(SPLIT_SIZE_OPTIONS)
+        self.split_size_row = Row("파일 분할", self.split_size_combo)
+        panel_layout.addWidget(self.split_size_row)
+
+        self.audio_processing_help = QLabel("")
+        self.audio_processing_help.setWordWrap(True)
+        self.audio_processing_help.setObjectName("helperLabel")
+        panel_layout.addWidget(self.audio_processing_help)
+
         self.video_quality_combo = self._combo(tuple((value, value) for value in SUPPORTED_VIDEO_QUALITIES))
         self.video_quality_row = Row("영상 화질", self.video_quality_combo)
         panel_layout.addWidget(self.video_quality_row)
@@ -999,6 +1027,8 @@ class MainWindow(QMainWindow):
             self.start_row,
             self.end_row,
             self.audio_format_row,
+            self.mp3_bitrate_row,
+            self.split_size_row,
             self.video_quality_row,
             self.subtitle_engine_row,
             self.subtitle_source_row,
@@ -1025,6 +1055,9 @@ class MainWindow(QMainWindow):
 
         self.task_type_combo.currentIndexChanged.connect(self.refresh_ui)
         self.batch_mode_combo.currentIndexChanged.connect(self.refresh_ui)
+        self.audio_format_combo.currentIndexChanged.connect(self.refresh_ui)
+        self.mp3_bitrate_combo.currentIndexChanged.connect(self.update_audio_processing_help)
+        self.split_size_combo.currentIndexChanged.connect(self.update_audio_processing_help)
         self.subtitle_engine_combo.currentIndexChanged.connect(self.refresh_ui)
         self.subtitle_source_combo.currentIndexChanged.connect(self.refresh_ui)
         self.whisper_runtime_combo.currentIndexChanged.connect(self.handle_whisper_runtime_change)
@@ -1084,9 +1117,12 @@ class MainWindow(QMainWindow):
         subtitle_source = self.current_subtitle_source()
         whisper_runtime = self.current_whisper_runtime()
         visibility = compute_visibility(task_type, batch_mode, subtitle_engine, subtitle_source, whisper_runtime)
+        mp3_audio_processing_visible = self.is_mp3_audio_processing_mode()
 
         self.url_row.setVisible(visibility["url"])
         self.audio_format_row.setVisible(visibility["audio_format"])
+        self.mp3_bitrate_row.setVisible(mp3_audio_processing_visible)
+        self.split_size_row.setVisible(mp3_audio_processing_visible)
         self.video_quality_row.setVisible(visibility["video_quality"])
         self.subtitle_engine_row.setVisible(visibility["subtitle_engine"])
         self.subtitle_source_row.setVisible(visibility["subtitle_source"])
@@ -1113,6 +1149,7 @@ class MainWindow(QMainWindow):
         pause_visible = supports_pause_resume(task_type, subtitle_engine, whisper_runtime)
         self.pause_button.setVisible(pause_visible)
         self.resume_button.setVisible(pause_visible)
+        self.update_audio_processing_help()
         self.update_responsive_layout()
         self.update_colab_buttons()
         self.update_pause_buttons()
@@ -1131,6 +1168,39 @@ class MainWindow(QMainWindow):
 
     def current_whisper_runtime(self) -> str:
         return str(self.whisper_runtime_combo.currentData())
+
+    def is_audio_processing_mode(self) -> bool:
+        task_type = self.current_task_type()
+        return task_type == "audio" or (task_type == "batch" and self.current_batch_mode() == "audio")
+
+    def is_mp3_audio_processing_mode(self) -> bool:
+        return self.is_audio_processing_mode() and str(self.audio_format_combo.currentData()) == "mp3"
+
+    def current_mp3_bitrate(self) -> str | None:
+        value = str(self.mp3_bitrate_combo.currentData() or "").strip().lower()
+        return value or None
+
+    def current_split_size_mb(self) -> int | None:
+        value = str(self.split_size_combo.currentData() or "").strip()
+        return int(value) if value else None
+
+    def update_audio_processing_help(self) -> None:
+        if not self.is_mp3_audio_processing_mode():
+            self.audio_processing_help.hide()
+            return
+
+        split_size_mb = self.current_split_size_mb()
+        bitrate = self.current_mp3_bitrate()
+        if split_size_mb is not None and bitrate is None:
+            self.audio_processing_help.setText(
+                f"분할을 켜고 비트레이트를 비워두면 {DEFAULT_SPLIT_MP3_BITRATE}로 MP3를 생성합니다. "
+                "조각이 여러 개면 ZIP으로 묶어 저장합니다."
+            )
+        else:
+            self.audio_processing_help.setText(
+                "MP3에서는 비트레이트를 조정할 수 있고, 필요하면 100MB부터 5MB까지 파일 분할을 적용할 수 있습니다."
+            )
+        self.audio_processing_help.show()
 
     def show_colab_help(self) -> None:
         bundle_name = self.colab_state.bundle_download_name if self.colab_state is not None else None
@@ -1276,6 +1346,8 @@ class MainWindow(QMainWindow):
             self.start_input,
             self.end_input,
             self.audio_format_combo,
+            self.mp3_bitrate_combo,
+            self.split_size_combo,
             self.video_quality_combo,
             self.subtitle_engine_combo,
             self.subtitle_source_combo,
@@ -1312,12 +1384,15 @@ class MainWindow(QMainWindow):
             raise ValueError("Whisper 전사용 오디오 파일을 선택해 주세요.")
 
         subtitle_language = normalize_optional_text(self.subtitle_language_input.text()) or "ko"
+        use_mp3_audio_processing = self.is_mp3_audio_processing_mode()
         return TaskConfig(
             task_type=task_type,
             url=url,
             start_time=normalize_optional_text(self.start_input.text()),
             end_time=normalize_optional_text(self.end_input.text()),
             audio_format=str(self.audio_format_combo.currentData()),
+            mp3_bitrate=self.current_mp3_bitrate() if use_mp3_audio_processing else None,
+            split_size_mb=self.current_split_size_mb() if use_mp3_audio_processing else None,
             video_quality=str(self.video_quality_combo.currentData()),
             subtitle_engine=subtitle_engine,
             subtitle_source=subtitle_source,

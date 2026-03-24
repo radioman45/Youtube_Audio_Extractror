@@ -8,7 +8,10 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.services.extraction_jobs import ExtractionJobStore
 from app.services.extractor import ExtractionResult
-from app.services.subtitle_extractor import SubtitleTrackNotFoundError
+from app.services.subtitle_extractor import (
+    SubtitleLanguageUnavailableError,
+    SubtitleTracksUnavailableError,
+)
 
 
 class InlineThread:
@@ -257,7 +260,7 @@ def test_auto_subtitle_endpoint_falls_back_to_whisper(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr(
         "app.main.extract_subtitles",
-        lambda options: (_ for _ in ()).throw(SubtitleTrackNotFoundError("no captions")),
+        lambda options: (_ for _ in ()).throw(SubtitleLanguageUnavailableError("requested language unavailable")),
     )
 
     def fake_extract_whisper_subtitles(options, progress_callback=None, temp_dir=None, resume_state_callback=None):
@@ -289,6 +292,27 @@ def test_auto_subtitle_endpoint_falls_back_to_whisper(monkeypatch, tmp_path: Pat
 
     assert response.status_code == 200
     assert normalize_newlines(response.content) == b"Fallback\n"
+
+
+def test_youtube_subtitle_endpoint_returns_language_mismatch_error_without_whisper_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "app.main.extract_subtitles",
+        lambda options: (_ for _ in ()).throw(SubtitleLanguageUnavailableError("requested language unavailable")),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/subtitles",
+        json={
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "subtitleEngine": "youtube",
+            "subtitleFormat": "clean",
+            "subtitleLanguage": "ko",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "requested language unavailable"
 
 
 def test_generic_video_job_dispatches_and_downloads(monkeypatch, tmp_path: Path):
@@ -457,7 +481,7 @@ def test_auto_subtitle_job_falls_back_to_whisper_and_records_resolved_path(monke
 
     monkeypatch.setattr(
         "app.main.extract_subtitles",
-        lambda options: (_ for _ in ()).throw(SubtitleTrackNotFoundError("no captions")),
+        lambda options: (_ for _ in ()).throw(SubtitleTracksUnavailableError("no captions")),
     )
 
     def fake_get_job_work_dir(job_id: str) -> Path:
@@ -885,3 +909,156 @@ def test_resume_pending_jobs_restarts_whisper_url_job(monkeypatch, tmp_path: Pat
     assert started[0][1][0] == job_id
     assert started[0][1][1].subtitle_engine == "whisper"
     assert started[0][1][1].whisper_device == "cpu"
+
+
+def test_healthcheck_exposes_audio_processing_capabilities():
+    client = TestClient(app)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "192k" in payload["mp3Bitrates"]
+    assert 25 in payload["splitSizesMb"]
+
+
+def test_extract_endpoint_accepts_audio_processing_fields(monkeypatch, tmp_path: Path):
+    captured = {}
+    work_dir = tmp_path / "job"
+    work_dir.mkdir()
+    output_file = work_dir / "track.mp3"
+    output_file.write_bytes(b"audio")
+
+    def fake_extract_audio(options):
+        captured["options"] = options
+        return ExtractionResult(
+            file_path=output_file,
+            download_name="track.mp3",
+            temp_dir=work_dir,
+        )
+
+    monkeypatch.setattr("app.main.extract_audio", fake_extract_audio)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "audioFormat": "mp3",
+            "mp3Bitrate": "128k",
+            "splitSizeMb": 25,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["options"].mp3_bitrate == "128k"
+    assert captured["options"].split_size_mb == 25
+
+
+def test_generic_audio_job_passes_audio_processing_options(monkeypatch, tmp_path: Path):
+    captured = {}
+    store = ExtractionJobStore()
+    work_dir = tmp_path / "job"
+    work_dir.mkdir()
+    output_file = work_dir / "track.zip"
+    output_file.write_bytes(b"zip")
+
+    def fake_extract_audio(options, progress_callback=None):
+        captured["options"] = options
+        assert progress_callback is not None
+        progress_callback(55, "Encoding split audio.")
+        return ExtractionResult(
+            file_path=output_file,
+            download_name="track.zip",
+            temp_dir=work_dir,
+            media_type="application/zip",
+        )
+
+    monkeypatch.setattr("app.main.job_store", store)
+    monkeypatch.setattr("app.main.extract_audio", fake_extract_audio)
+    monkeypatch.setattr("app.main.threading.Thread", InlineThread)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/api/jobs",
+        json={
+            "taskType": "audio",
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "audioFormat": "mp3",
+            "mp3Bitrate": "96k",
+            "splitSizeMb": 10,
+        },
+    )
+
+    assert create_response.status_code == 202
+    assert captured["options"].mp3_bitrate == "96k"
+    assert captured["options"].split_size_mb == 10
+
+    job_id = create_response.json()["jobId"]
+    status_response = client.get(f"/api/jobs/{job_id}")
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "completed"
+
+
+def test_job_endpoint_rejects_split_for_non_mp3_audio():
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/jobs",
+        json={
+            "taskType": "audio",
+            "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "audioFormat": "wav",
+            "splitSizeMb": 25,
+        },
+    )
+
+    assert response.status_code == 422
+    messages = [str(item["msg"]) for item in response.json()["detail"]]
+    assert any("File splitting is only available for MP3 output." in message for message in messages)
+
+
+def test_batch_audio_job_passes_audio_processing_options(monkeypatch, tmp_path: Path):
+    store = ExtractionJobStore()
+    work_dir = tmp_path / "job"
+    work_dir.mkdir()
+    output_file = work_dir / "batch.zip"
+    output_file.write_bytes(b"zip")
+
+    def fake_extract_batch(options, progress_callback=None, status_callback=None):
+        assert options.batch_mode == "audio"
+        assert options.mp3_bitrate == "128k"
+        assert options.split_size_mb == 5
+        assert progress_callback is not None
+        assert status_callback is not None
+        status_callback(2, 0, 0)
+        progress_callback(50, "Encoding batch audio.")
+        return ExtractionResult(
+            file_path=output_file,
+            download_name="batch.zip",
+            temp_dir=work_dir,
+            media_type="application/zip",
+        )
+
+    monkeypatch.setattr("app.main.job_store", store)
+    monkeypatch.setattr("app.main.extract_batch", fake_extract_batch)
+    monkeypatch.setattr("app.main.threading.Thread", InlineThread)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/api/jobs",
+        json={
+            "taskType": "batch",
+            "batchMode": "audio",
+            "url": "https://www.youtube.com/playlist?list=PL1234567890",
+            "audioFormat": "mp3",
+            "mp3Bitrate": "128k",
+            "splitSizeMb": 5,
+        },
+    )
+
+    assert create_response.status_code == 202
+    job_id = create_response.json()["jobId"]
+    status_response = client.get(f"/api/jobs/{job_id}")
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "completed"

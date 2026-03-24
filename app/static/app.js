@@ -6,6 +6,10 @@ const startTimeInput = document.querySelector("#startTime");
 const endTimeInput = document.querySelector("#endTime");
 const audioFormatField = document.querySelector("#audio-format-field");
 const audioFormatSelect = document.querySelector("#audioFormat");
+const mp3BitrateField = document.querySelector("#mp3-bitrate-field");
+const mp3BitrateSelect = document.querySelector("#mp3Bitrate");
+const splitSizeField = document.querySelector("#split-size-field");
+const splitSizeSelect = document.querySelector("#splitSizeMb");
 const videoQualityField = document.querySelector("#video-quality-field");
 const videoQualitySelect = document.querySelector("#videoQuality");
 const subtitleEngineField = document.querySelector("#subtitle-engine-field");
@@ -32,6 +36,7 @@ const vadFilterCheckbox = document.querySelector("#vadFilter");
 const subtitleEngineHelp = document.querySelector("#subtitle-engine-help");
 const batchModeField = document.querySelector("#batch-mode-field");
 const batchModeSelect = document.querySelector("#batchMode");
+const audioProcessingHelp = document.querySelector("#audio-processing-help");
 const rangeHelp = document.querySelector("#range-help");
 const folderButton = document.querySelector("#folder-button");
 const folderDisplay = document.querySelector("#folder-display");
@@ -323,6 +328,57 @@ function isPendingColabActiveJob(activeJob) {
   );
 }
 
+function isAudioProcessingMode() {
+  return currentMode === "audio" || (currentMode === "batch" && batchModeSelect.value === "audio");
+}
+
+function isMp3AudioProcessingMode() {
+  return isAudioProcessingMode() && audioFormatSelect.value === "mp3";
+}
+
+function getEffectiveMp3Bitrate() {
+  if (!isMp3AudioProcessingMode()) {
+    return null;
+  }
+
+  const selectedBitrate = String(mp3BitrateSelect.value || "").trim();
+  if (selectedBitrate) {
+    return selectedBitrate;
+  }
+
+  return String(splitSizeSelect.value || "").trim() ? "192k" : null;
+}
+
+function getEffectiveSplitSizeMb() {
+  if (!isMp3AudioProcessingMode()) {
+    return null;
+  }
+
+  const rawValue = String(splitSizeSelect.value || "").trim();
+  if (!rawValue) {
+    return null;
+  }
+
+  const parsedValue = Number(rawValue);
+  return Number.isFinite(parsedValue) ? parsedValue : null;
+}
+
+function syncAudioProcessingUi() {
+  const showAudioProcessing = isMp3AudioProcessingMode();
+  mp3BitrateField.classList.toggle("hidden", !showAudioProcessing);
+  splitSizeField.classList.toggle("hidden", !showAudioProcessing);
+  audioProcessingHelp.classList.toggle("hidden", !showAudioProcessing);
+
+  if (!showAudioProcessing) {
+    audioProcessingHelp.textContent = "";
+    return;
+  }
+
+  audioProcessingHelp.textContent = getEffectiveSplitSizeMb()
+    ? "Split output is available for MP3 only. If bitrate stays at Default, 192 kbps is used while splitting."
+    : "MP3 bitrate changes audio quality and file size. Split output is available for MP3 only.";
+}
+
 function buildColabJobSnapshot(job, fallbackName = "") {
   const details = job?.details || {};
   return {
@@ -492,6 +548,7 @@ function syncModeUi() {
   batchModeField.classList.toggle("hidden", currentMode !== "batch");
   audioFormatField.classList.toggle("hidden", !(currentMode === "audio" || (currentMode === "batch" && effectiveMode === "audio")));
   videoQualityField.classList.toggle("hidden", !(currentMode === "video" || (currentMode === "batch" && effectiveMode === "video")));
+  syncAudioProcessingUi();
 
   if (currentMode === "batch" && effectiveMode === "subtitle") {
     subtitleEngineSelect.value = "youtube";
@@ -631,15 +688,22 @@ function buildJsonPayload() {
     startTime: String(startTimeInput.value || "").trim() || null,
     endTime: String(endTimeInput.value || "").trim() || null,
   };
+  const mp3Bitrate = getEffectiveMp3Bitrate();
+  const splitSizeMb = getEffectiveSplitSizeMb();
+  const audioPayload = {
+    audioFormat: audioFormatSelect.value,
+    ...(mp3Bitrate ? { mp3Bitrate } : {}),
+    ...(splitSizeMb ? { splitSizeMb } : {}),
+  };
 
   if (currentMode === "audio") {
     return {
       uploadMode: false,
       endpoint: "/api/jobs",
-      fallbackName: `youtube-audio.${audioFormatSelect.value}`,
+      fallbackName: splitSizeMb ? "youtube-audio-split.zip" : `youtube-audio.${audioFormatSelect.value}`,
       body: JSON.stringify({
         ...commonPayload,
-        audioFormat: audioFormatSelect.value,
+        ...audioPayload,
       }),
     };
   }
@@ -704,7 +768,7 @@ function buildJsonPayload() {
       ...commonPayload,
       taskType: "batch",
       batchMode,
-      audioFormat: audioFormatSelect.value,
+      ...audioPayload,
       videoQuality: videoQualitySelect.value,
       subtitleFormat: getEffectiveSubtitleFormat(),
       subtitleLanguage: getEffectiveSubtitleLanguage() || "ko",
@@ -1095,6 +1159,9 @@ for (const button of modeButtons) {
 subtitleEngineSelect.addEventListener("change", syncSubtitleUi);
 subtitleSourceSelect.addEventListener("change", syncSubtitleUi);
 subtitleLanguageSelect.addEventListener("change", syncSubtitleLanguageUi);
+audioFormatSelect.addEventListener("change", syncModeUi);
+mp3BitrateSelect.addEventListener("change", syncAudioProcessingUi);
+splitSizeSelect.addEventListener("change", syncAudioProcessingUi);
 whisperRuntimeSelect.addEventListener("change", () => {
   if (getEffectiveWhisperRuntime() === "colab") {
     if (whisperModelSelect.value === "base") {
